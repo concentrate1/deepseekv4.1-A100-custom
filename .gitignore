@@ -28,4 +28,20 @@ compression/
 /tmp/
 scratch/
 dsv41/cpu/.*.so
+# runtime service logs and PID
+logs/
 
+# persistent image-aware prefix snapshots
+cache/
+
+# Private machine state, experiments, reports and reconstruction snapshots
+/local/
+/test_results
+/results
+/.agents/
+/skills-lock.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key

@@ -1,7 +1,7 @@
 """Server metrics collection and real-time dashboard for DeepSeek-v4.1.
 
 Tracks:
-- GPU memory & GPU utilization (strictly active GPUs 0, 1, 2, 3)
+- GPU memory & GPU utilization (backbone GPUs 0-3 and DSpark GPU 4)
 - System memory & CPU utilization
 - Active / in-flight client requests, total requests, client disconnections
 - Prefill metrics: hit rate %, reused vs new tokens, effective vs new tok/s
@@ -16,6 +16,8 @@ import time
 import threading
 import collections
 import os
+import re
+import math
 import psutil
 
 try:
@@ -25,12 +27,12 @@ try:
 except Exception:
     _HAS_NVML = False
 
-# Strict constraint: only GPUs 0, 1, 2, 3 are permitted for DeepSeek inference
-PERMITTED_GPUS = (0, 1, 2, 3)
+# The language backbone uses 0-3; DSpark and vision use GPU 4.
+PERMITTED_GPUS = (0, 1, 2, 3, 4)
 
 
 class StatsTracker:
-    def __init__(self, active_devices: list[int] | None = None, history_hours: float = 24.0, sample_interval: float = 5.0):
+    def __init__(self, active_devices: list[int] | None = None, history_hours: float = 24.0, sample_interval: float = 1.0):
         if active_devices is None:
             self.devices = list(PERMITTED_GPUS)
         else:
@@ -50,6 +52,8 @@ class StatsTracker:
         self.active_clients = 0
         self.total_requests = 0
         self.client_disconnects = 0
+        self.recent_inputs = collections.deque(maxlen=5)
+        self._input_sequence = 0
 
         # Throughput tracking
         self.latest_tok_s = 0.0
@@ -125,6 +129,17 @@ class StatsTracker:
             return self._update_decode_throughput_10s(now)
 
     # ------------------------------------------------ Shared / log throughput sync
+    @staticmethod
+    def _valid_decode_rate(value) -> bool:
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return False
+        # Physical single-stream decoding cannot produce thousands of tokens
+        # in one second here; such records come from a prefill-sampled first
+        # token or Jev's non-autoregressive effective throughput.
+        return math.isfinite(rate) and 0 < rate <= 1000
+
     def _sync_throughput_from_sources(self):
         import json
         import os
@@ -157,14 +172,15 @@ class StatsTracker:
             except Exception:
                 pass
 
+        recs = [(float(ts), float(val)) for ts, val in recs if self._valid_decode_rate(val)]
         if recs:
             with self.lock:
                 now = time.time()
                 for ts, val in recs:
-                    if now - float(ts) < (self.history_hours * 3600):
-                        self.tok_s_records.append((float(ts), float(val)))
+                    if now - ts < (self.history_hours * 3600):
+                        self.tok_s_records.append((ts, val))
                 # Only seed latest_tok_s if the last record is very recent (<15s)
-                if (now - float(recs[-1][0])) <= 15.0:
+                if (now - recs[-1][0]) <= 15.0:
                     self.latest_tok_s = float(recs[-1][1])
                     self.latest_request_type = "inference"
                 else:
@@ -214,6 +230,157 @@ class StatsTracker:
         with self.lock:
             self.active_clients = max(0, self.active_clients - 1)
 
+    @staticmethod
+    def _summarize_input(body: dict, max_chars: int = 6000) -> tuple[str, bool]:
+        """Readable request content; never put image data URLs on the dashboard."""
+        lines = []
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role", "message"))
+                content = message.get("content")
+                if isinstance(content, str):
+                    value = content
+                elif isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, str):
+                            parts.append(part)
+                        elif isinstance(part, dict):
+                            kind = part.get("type")
+                            if kind in ("text", "input_text"):
+                                parts.append(str(part.get("text", "")))
+                            elif kind in ("image_url", "input_image"):
+                                parts.append("[image]")
+                            else:
+                                parts.append(f"[{kind or 'content'}]")
+                    value = "\n".join(parts)
+                else:
+                    value = ""
+                if message.get("tool_calls"):
+                    names = [str((call.get("function") or {}).get("name", "tool"))
+                             for call in message["tool_calls"] if isinstance(call, dict)]
+                    value += "\n[tool calls: " + ", ".join(names) + "]"
+                lines.append(f"{role}: {value}")
+        elif body.get("prompt") is not None:
+            prompt = body["prompt"]
+            lines.append(str(prompt[0] if isinstance(prompt, list) and prompt else prompt))
+        text = "\n\n".join(lines) or "[no text input]"
+        text = re.sub(r"data:image/[^,\s]+,[A-Za-z0-9+/=]+", "[image data]", text)
+        truncated = len(text) > max_chars
+        if truncated:
+            text = f"[earlier input omitted; showing last {max_chars} characters]\n" + text[-max_chars:]
+        return text, truncated
+
+    @staticmethod
+    def _preview_image_source(value) -> str | None:
+        """Return a small inline thumbnail, or a browser-loadable HTTP URL."""
+        if isinstance(value, dict):
+            value = value.get("url")
+        if not isinstance(value, str):
+            return None
+        if value.startswith(("http://", "https://")):
+            return value
+        try:
+            import base64
+            import io
+            from PIL import Image
+
+            if value.startswith("data:image/") and ";base64," in value:
+                from .vision import load_image_bytes
+                raw = load_image_bytes({"url": value})
+            elif os.path.isfile(value):
+                with open(value, "rb") as image_file:
+                    raw = image_file.read(10 * 1024 * 1024 + 1)
+            else:
+                return None
+            if len(raw) > 10 * 1024 * 1024:
+                return None
+            with Image.open(io.BytesIO(raw)) as image:
+                from .vision import check_image_pixels
+                check_image_pixels(image)
+                image = image.convert("RGB")
+                image.thumbnail((256, 256))
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=72)
+            return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+        except Exception:
+            return None
+
+    @classmethod
+    def _input_messages(cls, body: dict) -> list[dict]:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            prompt = body.get("prompt", "")
+            messages = [{"role": "prompt", "content": prompt[0] if isinstance(prompt, list) and prompt else prompt}]
+        rendered = []
+        remaining_text = 6000
+        remaining_images = 4
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            parts = []
+            if isinstance(content, str):
+                cursor = 0
+                for match in re.finditer(r"<image>(.*?)</image>", content, re.DOTALL):
+                    if match.start() > cursor:
+                        parts.append({"type": "text", "text": content[cursor:match.start()]})
+                    parts.append({"type": "image", "url": match.group(1).strip()})
+                    cursor = match.end()
+                if cursor < len(content):
+                    parts.append({"type": "text", "text": content[cursor:]})
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, str):
+                        parts.append({"type": "text", "text": part})
+                    elif isinstance(part, dict):
+                        kind = part.get("type")
+                        if kind in ("text", "input_text"):
+                            parts.append({"type": "text", "text": str(part.get("text", ""))})
+                        elif kind in ("image_url", "input_image"):
+                            parts.append({"type": "image", "url": part.get("image_url") or part.get("image")})
+            blocks = []
+            for part in reversed(parts):
+                if part["type"] == "text":
+                    if remaining_text <= 0:
+                        continue
+                    value = re.sub(r"data:image/[^,\s]+,[A-Za-z0-9+/=]+", "[image data]", part["text"])
+                    if len(value) > remaining_text:
+                        value = "[earlier text omitted]\n" + value[-remaining_text:]
+                    remaining_text -= min(len(value), remaining_text)
+                    if value:
+                        blocks.insert(0, {"type": "text", "text": value})
+                elif remaining_images > 0:
+                    remaining_images -= 1
+                    source = cls._preview_image_source(part.get("url"))
+                    blocks.insert(0, {"type": "image", "src": source})
+                else:
+                    blocks.insert(0, {"type": "image", "src": None})
+            if blocks:
+                rendered.insert(0, {"role": str(message.get("role", "message")), "blocks": blocks})
+        return rendered
+
+    def record_input(self, body: dict, endpoint: str, prompt_tokens: int, request_id: str):
+        preview, truncated = self._summarize_input(body)
+        messages = self._input_messages(body)
+        has_image = any(block["type"] == "image" for message in messages for block in message["blocks"])
+        with self.lock:
+            self._input_sequence += 1
+            self.recent_inputs.append({
+                "id": self._input_sequence,
+                "request_id": request_id,
+                "endpoint": endpoint,
+                "prompt_tokens": prompt_tokens,
+                "timestamp": time.time(),
+                "text": preview,
+                "messages": messages,
+                "has_image": has_image,
+                "truncated": truncated,
+            })
+
     def record_disconnect(self):
         with self.lock:
             self.client_disconnects += 1
@@ -226,11 +393,24 @@ class StatsTracker:
                 self.cache_events.popleft()
 
     def record_throughput(self, tok_s: float, req_type: str = "gen"):
+        if req_type.startswith("jev") or not self._valid_decode_rate(tok_s):
+            return
         now = time.time()
         with self.lock:
             self.latest_tok_s = float(tok_s)
             self.latest_request_type = req_type
             self.tok_s_records.append((now, float(tok_s)))
+            # A short request may finish between sampler ticks.
+            # Give the throughput chart an exact completion event as well.
+            if tok_s > 0:
+                sample = dict(self.history[-1]) if self.history else {
+                    "cpu": 0.0, "ram_u": 0.0, "ram_t": 1.0,
+                    "active": self.active_clients, "gpu_mem": {}, "gpu_util": {},
+                    "prefill_eff_s": 0.0, "prefill_raw_s": 0.0,
+                }
+                sample.update(t=round(now, 1), tok_s=round(float(tok_s), 1),
+                              decode_tok_s=round(float(tok_s), 1))
+                self.history.append(sample)
             self._prune_old_records(now)
             self._save_shared_stats()
 
@@ -275,7 +455,7 @@ class StatsTracker:
             self.latest_prefill_duration_s = round(dt, 3)
             self.latest_prefill_timestamp = ts
 
-            type_label = "GPU Hit" if ptype == "gpu_hit" else ("Host Replay" if ptype == "host_replay" else "Cold")
+            type_label = "GPU Snapshot" if ptype == "gpu_snapshot" else "GPU Hit" if ptype == "gpu_hit" else ("Host Replay" if ptype == "host_replay" else "Cold")
             msg = f"Prefill [{mode} | {type_label}]: reused {reused:,} / {total:,} tokens (LCP {lcp_val:,}, {hit_rate}%) in {dt:.2f}s ({eff_s:,.0f} eff tok/s, {raw_s:,.0f} raw tok/s)"
             self.cache_events.append({
                 "t": time.time(),
@@ -297,8 +477,8 @@ class StatsTracker:
 
     def record_request_start(self, prompt_tokens: int, stream: bool = False):
         with self.lock:
-            self.active_clients += 1
-            self.total_requests += 1
+            # do_POST already counts the request at entry and releases it in
+            # its finally block. This method records prompt details only.
             self.cache_events.append({
                 "t": time.time(),
                 "msg": f"Incoming request: {prompt_tokens:,} tokens ({'stream' if stream else 'batch'})",
@@ -341,16 +521,26 @@ class StatsTracker:
                 mem_used, mem_total, gpu_util = self._query_gpus()
                 vm = psutil.virtual_memory()
                 cpu_pct = psutil.cpu_percent(interval=None)
+                remote_cache = {}
+                remote_engine = getattr(self, "remote_engine", None)
+                if remote_engine is not None:
+                    try:
+                        remote_cache = remote_engine.get_cache_stats()
+                    except Exception:
+                        pass
 
                 with self.lock:
                     self._prune_old_records(now)
                     decode_10s = self._update_decode_throughput_10s(now)
+                    remote_rate = remote_cache.get("decode_10s_tok_s")
+                    decode_10s = float(remote_rate) if remote_rate is not None else max(decode_10s, remote_cache.get("combined_decode_tok_s", 0.0))
+                    last_prefill = remote_cache.get("last_prefill") or {}
                     sample = {
                         "t": round(now, 1),
                         "tok_s": round(decode_10s, 1),
                         "decode_tok_s": round(decode_10s, 1),
-                        "prefill_eff_s": round(self.latest_prefill_effective_tok_s, 1),
-                        "prefill_raw_s": round(self.latest_prefill_raw_tok_s, 1),
+                        "prefill_eff_s": round(last_prefill.get("effective_tok_s", self.latest_prefill_effective_tok_s), 1),
+                        "prefill_raw_s": round(last_prefill.get("new_tok_s", self.latest_prefill_raw_tok_s), 1),
                         "active": self.active_clients,
                         "cpu": round(cpu_pct, 1),
                         "ram_u": round(vm.used / (1024 ** 3), 2),
@@ -392,6 +582,13 @@ class StatsTracker:
             else:
                 downsampled = hist_list
 
+            # Preserve original samples in the live window. Re-sampling the full
+            # history on each poll changes even historical points as it grows.
+            throughput_series = [sample for sample in hist_list if sample["t"] >= now - 600]
+            preceding = next((sample for sample in reversed(hist_list) if sample["t"] < now - 600), None)
+            if preceding is not None:
+                throughput_series.insert(0, preceding)
+
             cache_stats = {}
             if engine is not None:
                 try:
@@ -406,15 +603,18 @@ class StatsTracker:
             slots = cache_stats.get("slots", [])
             active_decode_slots = cache_stats.get("active_decode_slots", 0)
             combined_decode_tok_s = cache_stats.get("combined_decode_tok_s", 0.0)
+            if cache_stats.get("decode_10s_tok_s") is not None:
+                decode_10s = float(cache_stats["decode_10s_tok_s"])
 
             # Determine live decode throughput for the rolling 10s window:
             is_prefilling = any(s.get("status") == "prefilling" for s in slots)
             is_generating = any(s.get("status") == "generating" for s in slots)
 
             if is_prefilling:
-                live_decode_tok_s = 0.0
+                live_decode_tok_s = decode_10s if is_generating else 0.0
                 engine_phase = "prefill"
-                latest_type = "prefill (decode pending)" if is_generating else "prefilling"
+                latest_type = ("prefill + decode" if is_generating and decode_10s > 0
+                               else "prefill (decode pending)" if is_generating else "prefilling")
             elif is_generating or decode_10s > 0:
                 live_decode_tok_s = max(decode_10s, combined_decode_tok_s)
                 engine_phase = "decode"
@@ -447,70 +647,45 @@ class StatsTracker:
                 max_10m_tok_s = 0.0
                 min_10m_tok_s = 0.0
 
-            # Live prefill chunk progress
+            # Only report progress completed by the model's GPU stage events.
+            # A fixed tok/s guess made fast prefills appear to end near 14%.
             prefill_progress = None
             if is_prefilling:
                 active_pf_slot = next((s for s in slots if s.get("status") == "prefilling"), None)
-                p_tokens = active_pf_slot.get("prompt_tokens", 0) if active_pf_slot else 0
-                reused_tokens_active = active_pf_slot.get("reused_tokens", 0) if active_pf_slot else 0
-                lcp_active = active_pf_slot.get("lcp", reused_tokens_active) if active_pf_slot else 0
-                is_replay = reused_tokens_active > 0
-                prefill_type = "gpu_hit" if is_replay else "cold"
-                if active_pf_slot and active_pf_slot.get("prefill_type"):
-                    prefill_type = active_pf_slot.get("prefill_type")
-
-                # If replaying a prefix, compute progress over the suffix tokens instead of entire prompt
-                target_tokens = max(1, p_tokens - reused_tokens_active) if is_replay else p_tokens
-                tot_chunks = max(1, (target_tokens + 1023) // 1024)
-                cur_chunks = 0
-                try:
-                    import subprocess
-                    p = subprocess.run(
-                        ["tmux", "capture-pane", "-t", "dsv41-server", "-p", "-S", "-300"],
-                        capture_output=True, text=True, timeout=0.3
-                    )
-                    lines = p.stdout.splitlines()
-                    for line in reversed(lines):
-                        if "compact=1" in line:
-                            cur_chunks += 1
-                        elif "MISS" in line or "prefill-main" in line or "BUILD" in line or "LCP-HIT" in line or "gpu-slot-cache" in line:
-                            break
-                except Exception:
-                    pass
-
-                pf_start = active_pf_slot.get("start_time", 0.0) if active_pf_slot else 0.0
-                pf_elapsed = max(0.0, time.perf_counter() - pf_start) if pf_start else 0.0
-                if cur_chunks == 0 and pf_elapsed > 0 and target_tokens > 0:
-                    cur_chunks = min(tot_chunks, max(1, int(pf_elapsed * 265.0 / 1024.0)))
-
-                cur_tokens = min(target_tokens, cur_chunks * 1024) if target_tokens else 0
-                pct = round((cur_tokens / max(1, target_tokens)) * 100, 1) if target_tokens else 0.0
-                pf_speed = round(cur_tokens / max(pf_elapsed, 1.0), 1) if cur_tokens > 0 else 265.0
-                rem_tok = max(0, target_tokens - cur_tokens)
-                rem_sec = int(rem_tok / max(pf_speed, 50.0))
-
-                hit_rate = round((reused_tokens_active / max(1, p_tokens)) * 100, 1) if p_tokens else 0.0
-
-                prefill_progress = {
-                    "active": True,
-                    "is_replay": is_replay,
-                    "prefill_type": prefill_type,
-                    "slot_id": active_pf_slot.get("slot_id") if active_pf_slot else 1,
-                    "current_chunk": cur_chunks,
-                    "total_chunks": tot_chunks,
-                    "current_tokens": cur_tokens,
-                    "total_tokens": p_tokens,
-                    "reused_tokens": reused_tokens_active,
-                    "suffix_tokens": target_tokens,
-                    "lcp": lcp_active,
-                    "hit_rate_pct": hit_rate,
-                    "percent": pct,
-                    "speed_tok_s": pf_speed,
-                    "elapsed_s": round(pf_elapsed, 1),
-                    "eta_s": rem_sec,
-                    "eta_str": f"{rem_sec // 60}m {rem_sec % 60}s" if rem_sec >= 60 else f"{rem_sec}s",
-                }
+                work = cache_stats.get("prefill_work") or {}
                 if active_pf_slot:
+                    pf_start = active_pf_slot.get("start_time", 0.0)
+                    active_pf_slot["elapsed_s"] = round(max(0.0, time.perf_counter() - pf_start), 1) if pf_start else 0.0
+                if active_pf_slot and work.get("total_tokens", 0) > 0:
+                    p_tokens = active_pf_slot.get("prompt_tokens", 0)
+                    target_tokens = int(work["total_tokens"])
+                    cur_tokens = max(0, min(target_tokens, int(work.get("completed_tokens", 0))))
+                    reused = int(work.get("reused_tokens", max(int(active_pf_slot.get("reused_tokens", 0)), int(work.get("start_pos", 0)))))
+                    is_replay = reused > 0
+                    elapsed = float(work.get("elapsed_s", 0.0))
+                    speed = cur_tokens / elapsed if cur_tokens > 0 and elapsed > 0 else 0.0
+                    rem_sec = int((target_tokens - cur_tokens) / speed) if speed > 0 else None
+                    hit_rate = round(reused / max(p_tokens, 1) * 100, 1) if p_tokens else 0.0
+                    prefill_progress = {
+                        "active": True,
+                        "measured": True,
+                        "is_replay": is_replay,
+                        "prefill_type": work.get("prefill_type") or active_pf_slot.get("prefill_type") or ("host_replay" if is_replay else "cold"),
+                        "slot_id": active_pf_slot.get("slot_id", 0),
+                        "current_chunk": int(work.get("completed_chunks", 0)),
+                        "total_chunks": int(work.get("total_chunks", 0)),
+                        "current_tokens": cur_tokens,
+                        "total_tokens": p_tokens,
+                        "reused_tokens": reused,
+                        "suffix_tokens": target_tokens,
+                        "lcp": reused,
+                        "hit_rate_pct": hit_rate,
+                        "percent": round(cur_tokens / target_tokens * 100, 1),
+                        "speed_tok_s": round(speed, 1),
+                        "elapsed_s": round(elapsed, 1),
+                        "eta_s": rem_sec,
+                        "eta_str": f"{rem_sec // 60}m {rem_sec % 60}s" if rem_sec is not None and rem_sec >= 60 else (f"{rem_sec}s" if rem_sec is not None else "--"),
+                    }
                     active_pf_slot["prefill_progress"] = prefill_progress
 
             # Prefill throughput details
@@ -547,11 +722,13 @@ class StatsTracker:
                 "active_clients": self.active_clients,
                 "total_requests": self.total_requests,
                 "client_disconnects": self.client_disconnects,
+                "recent_inputs": list(self.recent_inputs)[-1:],
                 "engine_phase": engine_phase,
                 "prefill_progress": prefill_progress,
                 "slots": slots,
                 "active_decode_slots": active_decode_slots,
                 "combined_decode_tok_s": combined_decode_tok_s,
+                "mtp": cache_stats.get("mtp", {}),
                 "decode_throughput_10s": round(live_decode_tok_s, 1),
                 "decode_max_10m": max_10m_tok_s,
                 "decode_min_10m": min_10m_tok_s,
@@ -597,6 +774,8 @@ class StatsTracker:
                 "prefill_history": prefill_history,
                 "cache_events": list(self.cache_events),
                 "series": downsampled,
+                "throughput_series": throughput_series,
+                "chart_time": now,
             }
 
     # ------------------------------------------------ Embedded Web Dashboard HTML
@@ -891,7 +1070,7 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     border: 1px solid #161e2b;
     border-radius: 6px;
     padding: 8px 10px;
-    height: 165px;
+    height: 220px;
     overflow-y: auto;
     font-family: var(--font-mono);
     font-size: 11px;
@@ -1079,20 +1258,10 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="badge">Engine</span>
     <div>
       <div class="title">DeepSeek-v4.1 Flash · Live Inference & Prefill Monitor</div>
-      <div class="sub-title">Model: <code style="color:var(--accent-blue)">__MODEL_NAME__</code> · Hardware: <span style="color:var(--accent-purple)">GPUs 0, 1, 2, 3 (4 &times; A100 80GB)</span> · Uptime: <span id="uptime-val">Loading...</span></div>
+      <div class="sub-title">Model: <code style="color:var(--accent-blue)">__MODEL_NAME__</code> · Hardware: <span style="color:var(--accent-purple)">GPUs 0–3 backbone + GPU 4 DSpark/vision</span> · Uptime: <span id="uptime-val">Loading...</span></div>
     </div>
   </div>
   <div class="header-badges">
-    <a href="http://tsuginosuke:8888" id="jev-arcade-link" target="_blank" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; font-size:13px; font-weight:700; color:#fff; background:linear-gradient(135deg, #a855f7, #ec4899); padding:6px 14px; border-radius:8px; box-shadow:0 0 12px rgba(168,85,247,0.4); transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1.0">🎮 Jev Arcade (20 AI Games)</a>
-    <script>
-      // Dynamically use current host for the Jev Arcade link
-      document.addEventListener('DOMContentLoaded', () => {
-        const link = document.getElementById('jev-arcade-link');
-        if (link && window.location.hostname) {
-          link.href = 'http://' + window.location.hostname + ':8888';
-        }
-      });
-    </script>
     <div class="phase-tag" id="engine-phase-badge">PHASE: IDLE</div>
     <div class="status-tag">
       <div class="pulse"></div>
@@ -1125,6 +1294,17 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="kpi-sub">
       <span>Cur: <b id="val-latest-tok" style="color:#fff">0.0</b> tok/s</span>
       <span id="val-req-type">Mode: Idle</span>
+    </div>
+  </div>
+
+  <div class="kpi-card" id="mtp-metrics" style="display:none">
+    <div class="kpi-title">DSpark Speculative Decode</div>
+    <div class="kpi-value" style="font-size:22px;color:var(--accent-purple)">
+      <span id="mtp-accepted">0</span> / <span id="mtp-drafted">0</span>
+    </div>
+    <div class="kpi-sub">
+      <span>Accepted / drafted · <b id="mtp-acceptance">0.0</b>%</span>
+      <span><b id="mtp-steps">0</b> verify steps · <b id="mtp-accepted-step">0.00</b> accepted/step</span>
     </div>
   </div>
 
@@ -1177,6 +1357,18 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Most recent request input, kept separate from the output stream -->
+<div class="slots-section">
+  <div class="slots-header">
+    <div>
+      <div class="chart-title">Latest Request Input</div>
+      <div class="chart-meta">Message roles and text; image payloads are shown as placeholders</div>
+    </div>
+    <div class="chart-meta" id="request-input-meta">Waiting for a request</div>
+  </div>
+  <div id="request-input-preview" style="background:#0d1118;border:1px solid #1c2331;border-radius:10px;padding:14px 16px;max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 var(--font-mono);color:var(--text-main)">Waiting for a request...</div>
+</div>
+
 <!-- Concurrent Context Streams (Real-Time Token Generation) -->
 <div class="slots-section">
   <div class="slots-header">
@@ -1218,11 +1410,11 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Chart 2: GPU VRAM & Utilization (GPUs 0, 1, 2, 3) -->
+  <!-- Chart 2: GPU VRAM & Utilization (backbone and DSpark) -->
   <div class="chart-card">
     <div class="chart-header">
-      <div class="chart-title">GPU VRAM & Utilization (GPUs 0, 1, 2, 3)</div>
-      <div class="chart-meta">Active Devices: 4 &times; A100 80GB</div>
+      <div class="chart-title">GPU VRAM & Utilization (GPUs 0–4)</div>
+      <div class="chart-meta">Active Devices: 5 &times; A100 80GB</div>
     </div>
     <div class="canvas-wrap" style="height:170px;">
       <canvas id="chart-gpu"></canvas>
@@ -1381,6 +1573,8 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
 // Standalone lightweight offline Canvas charting engine
+let throughputMaxY = 10;
+
 function drawLineChart(canvas, series, options) {
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
@@ -1413,8 +1607,8 @@ function drawLineChart(canvas, series, options) {
   series.forEach(s => {
     s.data.forEach(v => {
       if (v !== null && v !== undefined) {
-        if (v < minY) minY = v;
-        if (v > maxY) maxY = v;
+        if (options.minY === undefined && v < minY) minY = v;
+        if (options.maxY === undefined && v > maxY) maxY = v;
       }
     });
   });
@@ -1423,7 +1617,7 @@ function drawLineChart(canvas, series, options) {
     minY = 0;
     maxY = maxY <= 0 ? 10 : maxY * 1.2;
   } else {
-    maxY = maxY * 1.15;
+    if (options.maxY === undefined) maxY = maxY * 1.15;
     if (options.zeroMin) minY = 0;
   }
 
@@ -1445,7 +1639,9 @@ function drawLineChart(canvas, series, options) {
   }
 
   const N = series[0].data.length;
-  const getX = (i) => padL + (i / Math.max(1, N - 1)) * plotW;
+  const getX = (i) => options.timestamps
+    ? padL + ((options.timestamps[i] - options.timeMin) / (options.timeMax - options.timeMin)) * plotW
+    : padL + (i / Math.max(1, N - 1)) * plotW;
   const getY = (val) => padT + plotH - ((val - minY) / Math.max(1e-6, maxY - minY)) * plotH;
 
   if (options.refLine !== undefined && options.refLine >= minY && options.refLine <= maxY) {
@@ -1460,6 +1656,10 @@ function drawLineChart(canvas, series, options) {
     ctx.setLineDash([]);
   }
 
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(padL, padT, plotW, plotH);
+  ctx.clip();
   series.forEach(s => {
     if (!s.data || s.data.length === 0) return;
     ctx.strokeStyle = s.color || '#38bdf8';
@@ -1483,6 +1683,8 @@ function drawLineChart(canvas, series, options) {
     }
   });
 
+  ctx.restore();
+
   if (options.timeLabels && options.timeLabels.length >= 2) {
     ctx.fillStyle = '#64748b';
     ctx.font = '10px monospace';
@@ -1503,11 +1705,86 @@ function formatNum(n) {
   return Number(n).toLocaleString();
 }
 
+function updateMtpCard(mtp) {
+  const card = document.getElementById('mtp-metrics');
+  if (!card) return;
+  const display = mtp.enabled ? 'flex' : 'none';
+  if (card.style.display !== display) card.style.display = display;
+  if (!mtp.enabled) return;
+  const setValue = (id, value) => {
+    const el = document.getElementById(id);
+    const next = String(value);
+    if (el && el.textContent !== next) el.textContent = next;
+  };
+  setValue('mtp-accepted', mtp.accepted || 0);
+  setValue('mtp-drafted', mtp.drafted || 0);
+  setValue('mtp-acceptance', Number(mtp.acceptance_pct || 0).toFixed(1));
+  setValue('mtp-steps', mtp.steps || 0);
+  setValue('mtp-accepted-step', Number(mtp.accepted_per_step || 0).toFixed(2));
+}
+
+window.__mtpStreamConnected = false;
+const mtpEvents = new EventSource('/api/mtp/stream');
+mtpEvents.onmessage = event => {
+  try {
+    updateMtpCard(JSON.parse(event.data));
+    window.__mtpStreamConnected = true;
+  } catch (error) {
+    console.error('Invalid DSpark metrics event', error);
+  }
+};
+mtpEvents.onerror = () => { window.__mtpStreamConnected = false; };
+
 async function updateMetrics() {
   try {
     const res = await fetch('/api/metrics');
     if (!res.ok) return;
     const data = await res.json();
+
+    const recentInputs = data.recent_inputs || [];
+    const latestInput = recentInputs[recentInputs.length - 1];
+    if (latestInput) {
+      const preview = document.getElementById('request-input-preview');
+      const meta = document.getElementById('request-input-meta');
+      const inputKey = latestInput.request_id || String(latestInput.id);
+      if (preview && preview.dataset.inputId !== inputKey) {
+        const fragment = document.createDocumentFragment();
+        for (const message of latestInput.messages || []) {
+          const group = document.createElement('div');
+          group.style.marginBottom = '12px';
+          const role = document.createElement('div');
+          role.style.cssText = 'color:var(--accent-blue);font-weight:700;margin-bottom:5px';
+          role.textContent = message.role;
+          group.appendChild(role);
+          for (const block of message.blocks || []) {
+            if (block.type === 'image') {
+              if (block.src) {
+                const img = document.createElement('img');
+                img.src = block.src;
+                img.alt = 'Request image';
+                img.loading = 'lazy';
+                img.style.cssText = 'display:block;max-width:256px;max-height:256px;border-radius:8px;border:1px solid #334155;margin:7px 0';
+                group.appendChild(img);
+              } else {
+                const placeholder = document.createElement('div');
+                placeholder.textContent = '[image preview unavailable]';
+                group.appendChild(placeholder);
+              }
+            } else {
+              const text = document.createElement('div');
+              text.textContent = block.text || '';
+              group.appendChild(text);
+            }
+          }
+          fragment.appendChild(group);
+        }
+        if (fragment.childNodes.length) preview.replaceChildren(fragment);
+        else preview.textContent = latestInput.text;
+        preview.dataset.inputId = inputKey;
+        preview.scrollTop = 0;
+        if (meta) meta.textContent = `${formatTime(latestInput.timestamp)} · ${latestInput.endpoint} · ${formatNum(latestInput.prompt_tokens)} prompt tokens${latestInput.truncated ? ' · truncated' : ''}`;
+      }
+    }
 
     // 1. Header & Engine Phase
     document.getElementById('uptime-val').innerText = data.uptime_str || '--';
@@ -1526,7 +1803,7 @@ async function updateMetrics() {
       const pfProg = data.prefill_progress;
       if (pfProg && pfProg.active) {
         if (pfProg.is_replay) {
-          const pfxType = pfProg.prefill_type === 'gpu_hit' ? 'GPU HIT' : 'HOST REPLAY';
+          const pfxType = pfProg.prefill_type === 'gpu_snapshot' ? 'GPU SNAPSHOT' : (pfProg.prefill_type === 'gpu_hit' ? 'GPU HIT' : 'HOST REPLAY');
           phaseEl.innerText = `PHASE: PREFIX REPLAY [${pfxType}] · ${pfProg.hit_rate_pct}% HIT (LCP ${formatNum(pfProg.lcp)}) · ${formatNum(pfProg.suffix_tokens)} SUFFIX TOK · ETA ${pfProg.eta_str}`;
           phaseEl.style.color = 'var(--accent-green)';
           phaseEl.style.borderColor = 'rgba(74, 222, 128, 0.4)';
@@ -1574,6 +1851,9 @@ async function updateMetrics() {
     document.getElementById('val-clients').innerText = data.active_clients;
     document.getElementById('val-total-req').innerText = data.total_requests;
     document.getElementById('val-broken-pipe').innerText = data.client_disconnects;
+
+    // The dedicated EventSource updates this card between dashboard polls.
+    if (!window.__mtpStreamConnected) updateMtpCard(data.mtp || (data.cache && data.cache.mtp) || {});
 
     const tp = data.throughput || {};
     const decodeSpeed = (data.decode_throughput_10s !== undefined ? data.decode_throughput_10s : (tp.latest_tok_s || 0));
@@ -1648,8 +1928,8 @@ async function updateMetrics() {
 
     const typeBadge = document.getElementById('val-prefill-type-badge');
     if (typeBadge) {
-      if (prefillType === 'gpu_hit') {
-        typeBadge.innerText = 'GPU HIT';
+      if (prefillType === 'gpu_hit' || prefillType === 'gpu_snapshot') {
+        typeBadge.innerText = prefillType === 'gpu_snapshot' ? 'GPU SNAPSHOT' : 'GPU HIT';
         typeBadge.className = 'tag tag-hit';
         typeBadge.style.color = 'var(--accent-green)';
         typeBadge.style.background = 'rgba(74, 222, 128, 0.2)';
@@ -1743,10 +2023,10 @@ async function updateMetrics() {
         }
         else if (isComp) { badgeClass = 'tag-store'; badgeText = '✓ COMPLETED'; }
 
-        const maxTok = (isPrefill && pfProg) ? (pfProg.is_replay ? pfProg.suffix_tokens : pfProg.total_tokens) : (s.max_tokens || 1024);
+        const maxTok = isPrefill ? (pfProg ? (pfProg.is_replay ? pfProg.suffix_tokens : pfProg.total_tokens) : (s.prompt_tokens || 0)) : (s.max_tokens || 1024);
         const genTok = (isPrefill && pfProg) ? pfProg.current_tokens : (s.generated_tokens || 0);
         const pct = (isPrefill && pfProg && pfProg.percent !== undefined) ? pfProg.percent : Math.min(100, maxTok > 0 ? (genTok / maxTok * 100) : 0);
-        const speed = (isPrefill && pfProg && pfProg.speed_tok_s) ? pfProg.speed_tok_s.toFixed(1) : (s.tok_s || 0).toFixed(1);
+        const speed = isPrefill ? (pfProg ? pfProg.speed_tok_s.toFixed(1) : '--') : (s.tok_s || 0).toFixed(1);
         const promptTok = s.prompt_tokens ? (s.prompt_tokens >= 1000 ? (s.prompt_tokens / 1000).toFixed(1) + 'k' : s.prompt_tokens) : '--';
         const elapsed = (isPrefill && pfProg && pfProg.elapsed_s ? pfProg.elapsed_s : (s.elapsed_s || 0)).toFixed(1) + 's';
 
@@ -1760,12 +2040,15 @@ async function updateMetrics() {
             const filledLen = Math.min(barLen, Math.round((pfProg.percent / 100) * barLen));
             const barStr = '█'.repeat(filledLen) + '░'.repeat(barLen - filledLen);
             if (pfProg.is_replay) {
-              const srcSlot = s.reused_slot !== undefined && s.reused_slot >= 0 ? ` Slot ${s.reused_slot}` : '';
-              textContent = `<span style="color:var(--accent-green);font-weight:700">/* PREFIX REPLAY: ${pfProg.hit_rate_pct}% LCP hit · Reusing ${formatNum(pfProg.reused_tokens)} tok from${srcSlot || ' cache'} */</span>\n` +
+              const hasSourceSlot = Number.isInteger(s.reused_slot) && s.reused_slot >= 0;
+              const prefixSource = pfProg.prefill_type === 'gpu_snapshot' ? 'GPU prefix snapshot' : pfProg.prefill_type === 'gpu_hit'
+                ? (hasSourceSlot ? `GPU slot ${s.reused_slot}` : 'GPU prefix cache')
+                : 'CPU prefix snapshot';
+              textContent = `<span style="color:var(--accent-green);font-weight:700">/* PREFIX REPLAY: ${pfProg.hit_rate_pct}% LCP hit · Reusing ${formatNum(pfProg.reused_tokens)} tok from ${prefixSource} */</span>\n` +
                 `<span style="color:var(--accent-cyan)">[${barStr}]</span> Replaying suffix: ${formatNum(pfProg.current_tokens)} / ${formatNum(pfProg.suffix_tokens)} tokens (${pfProg.percent}%)\n` +
                 `<span style="color:var(--text-muted)">Replay rate: <b>${pfProg.speed_tok_s} tok/s</b> · Elapsed: <b>${pfProg.elapsed_s}s</b> · ETA: <b style="color:var(--accent-green)">~${pfProg.eta_str}</b></span>`;
             } else {
-              textContent = `<span style="color:var(--accent-orange);font-weight:700">/* COLD PREFILL (No prefix cache): chunk ${pfProg.current_chunk}/${pfProg.total_chunks} (${pfProg.percent}%) */</span>\n` +
+              textContent = `<span style="color:var(--accent-orange);font-weight:700">/* COLD PREFILL (No prefix reused for this request): chunk ${pfProg.current_chunk}/${pfProg.total_chunks} (${pfProg.percent}%) */</span>\n` +
                 `<span style="color:var(--accent-blue)">[${barStr}]</span> ${formatNum(pfProg.current_tokens)} / ${formatNum(pfProg.total_tokens)} tokens\n` +
                 `<span style="color:var(--text-muted)">Compute rate: <b>${pfProg.speed_tok_s} tok/s</b> · Elapsed: <b>${pfProg.elapsed_s}s</b> · ETA: <b style="color:var(--accent-green)">~${pfProg.eta_str}</b></span>`;
             }
@@ -1791,7 +2074,7 @@ async function updateMetrics() {
               <span class="tag ${badgeClass}">${badgeText}</span>
             </div>
             <div class="slot-stats-row">
-              <div class="slot-tokens-stat">${formatNum(genTok)} <span>/ ${formatNum(maxTok)} tok ${isPrefill ? '(' + pct.toFixed(0) + '%)' : ''}</span></div>
+              <div class="slot-tokens-stat">${formatNum(genTok)} <span>/ ${formatNum(maxTok)} tok ${isPrefill && pfProg ? '(' + pct.toFixed(0) + '%)' : ''}</span></div>
               <div class="slot-speed-stat">${speed} tok/s ${isPrefill ? '(prefill)' : ''}</div>
             </div>
             <div class="slot-bar-bg">
@@ -1805,14 +2088,87 @@ async function updateMetrics() {
           </div>
         `;
       });
-      slotsContainer.innerHTML = slotsHtml;
-
-      slots.forEach(s => {
-        const term = document.getElementById('slot-term-' + s.slot_id);
-        if (term && (s.status === 'generating' || s.status === 'completed')) {
-          term.scrollTop = term.scrollHeight;
-        }
-      });
+      // Preserve each slot's DOM node and append new text in place. Replacing
+      // the entire grid on every poll made the output flash and reset scroll.
+      if (!slotsContainer.querySelector('.slot-card')) {
+        slotsContainer.innerHTML = slotsHtml;
+        slots.forEach(s => {
+          const term = document.getElementById('slot-term-' + s.slot_id);
+          if (term) {
+            term.dataset.rawText = s.recent_text || '';
+            if (s.recent_text) {
+              term.textContent = s.recent_text;
+              if (s.status === 'generating') {
+                const cursor = document.createElement('span');
+                cursor.className = 'cursor';
+                cursor.textContent = '▋';
+                term.appendChild(cursor);
+              }
+              term.scrollTop = term.scrollHeight;
+            }
+          }
+        });
+      } else {
+        const template = document.createElement('div');
+        template.innerHTML = slotsHtml;
+        const wanted = new Set();
+        Array.from(template.children).forEach(nextCard => {
+          wanted.add(nextCard.id);
+          let card = document.getElementById(nextCard.id);
+          if (!card) {
+            slotsContainer.appendChild(nextCard);
+            card = nextCard;
+          } else {
+            if (card.className !== nextCard.className) card.className = nextCard.className;
+            for (const selector of ['.slot-head .tag', '.slot-tokens-stat', '.slot-speed-stat', '.slot-meta-row']) {
+              const current = card.querySelector(selector);
+              const next = nextCard.querySelector(selector);
+              if (current && next) {
+                if (current.className !== next.className) current.className = next.className;
+                if (current.innerHTML !== next.innerHTML) current.innerHTML = next.innerHTML;
+              }
+            }
+            const bar = card.querySelector('.slot-bar-fill');
+            const nextBar = nextCard.querySelector('.slot-bar-fill');
+            if (bar && nextBar && bar.style.cssText !== nextBar.style.cssText) bar.style.cssText = nextBar.style.cssText;
+          }
+          const slotId = Number(card.id.slice('slot-card-'.length));
+          const state = slots.find(s => s.slot_id === slotId);
+          const term = card.querySelector('.slot-terminal');
+          const nextTerm = nextCard.querySelector('.slot-terminal');
+          if (!term || !state || !nextTerm) return;
+          const nearBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 30;
+          if (state.recent_text) {
+            const previous = term.dataset.rawText || '';
+            const incoming = state.recent_text;
+            if (incoming !== previous) {
+              if (previous && incoming.startsWith(previous)) {
+                const cursor = term.querySelector('.cursor');
+                term.insertBefore(document.createTextNode(incoming.slice(previous.length)), cursor || null);
+              } else {
+                term.textContent = incoming;
+              }
+              term.dataset.rawText = incoming;
+            }
+            let cursor = term.querySelector('.cursor');
+            if (state.status === 'generating' && !cursor) {
+              cursor = document.createElement('span');
+              cursor.className = 'cursor';
+              cursor.textContent = '▋';
+              term.appendChild(cursor);
+            } else if (state.status !== 'generating' && cursor) {
+              cursor.remove();
+            }
+          } else if (term.innerHTML !== nextTerm.innerHTML) {
+            term.innerHTML = nextTerm.innerHTML;
+            term.dataset.rawText = '';
+          }
+          if (nearBottom) term.scrollTop = term.scrollHeight;
+        });
+        Array.from(slotsContainer.children).forEach(card => {
+          if (!wanted.has(card.id)) card.remove();
+        });
+      }
     }
 
     // 3. Live Prefill Monitor
@@ -1910,11 +2266,14 @@ async function updateMetrics() {
           <div class="event-line">
             <span class="event-time">${tStr}</span>
             <span class="tag ${tagClass}">${tagText}</span>
-            <span class="event-msg">${ev.msg}</span>
+            <span class="event-msg"></span>
           </div>
         `;
       });
       eventBox.innerHTML = evHtml;
+      eventBox.querySelectorAll(".event-msg").forEach((node, index) => {
+        node.textContent = String(events.slice(-40)[index].msg || "");
+      });
       eventBox.scrollTop = eventBox.scrollHeight;
     }
 
@@ -1944,9 +2303,9 @@ async function updateMetrics() {
       histTbody.innerHTML = histHtml;
     }
 
-    // 8. GPU Mini-Cards (strictly permitted GPUs 0, 1, 2, 3)
+    // 8. GPU Mini-Cards, including DSpark / vision on GPU 4
     const g = data.gpus || {};
-    const devs = (g.devices || [0, 1, 2, 3]).filter(d => [0, 1, 2, 3].includes(d));
+    const devs = (g.devices || [0, 1, 2, 3, 4]).filter(d => [0, 1, 2, 3, 4].includes(d));
     const gpuContainer = document.getElementById('gpu-cards-container');
     let gpuCardsHtml = '';
     devs.forEach(d => {
@@ -1978,18 +2337,29 @@ async function updateMetrics() {
       const timeLabels = [formatTime(series[0].t), formatTime(series[series.length - 1].t)];
 
       // Chart 1: Throughput
-      const tokData = series.map(s => s.tok_s);
+      const chartTime = data.chart_time || Date.now() / 1000;
+      const tokSeries = data.throughput_series || series.filter(s => s.t >= chartTime - 600);
+      const tokData = tokSeries.map(s => s.tok_s);
+      // Keep the vertical scale when peaks leave the window; grow only when
+      // necessary, in rounded steps, rather than re-scaling on every poll.
+      const peak = tokData.reduce((max, value) => Math.max(max, value || 0), 0);
+      if (peak > throughputMaxY) throughputMaxY = Math.ceil(peak * 1.15 / 10) * 10;
       drawLineChart(document.getElementById('chart-throughput'), [
         { data: tokData, color: '#34d399', width: 2, fill: 'rgba(52, 211, 153, 0.08)' }
       ], {
         decimals: 1,
         zeroMin: true,
+        minY: 0,
+        maxY: throughputMaxY,
+        timestamps: tokSeries.map(s => s.t),
+        timeMin: chartTime - 600,
+        timeMax: chartTime,
         refLine: tp.avg_24h_tok_s,
         refColor: '#c084fc',
-        timeLabels: timeLabels,
+        timeLabels: [formatTime(chartTime - 600), formatTime(chartTime)],
       });
 
-      // Chart 2: GPU Util (GPUs 0, 1, 2, 3)
+      // Chart 2: GPU utilization, including DSpark GPU 4
       const gpuColors = ['#38bdf8', '#34d399', '#c084fc', '#fb923c'];
       const gpuSeries = devs.map((d, idx) => ({
         data: series.map(s => (s.gpu_util && s.gpu_util[d]) || 0),

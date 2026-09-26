@@ -137,9 +137,12 @@ class DSparkRows(DSpark):
     """Same computation as DSpark.draft, for S sequences at once on the runtime's fused kernels (rows = S x block).
     The draft blocks' window rings hold kv(main_x) of the main positions (write_main_rows, per row: sequence + position)."""
 
-    def __init__(self, ckpt, args, device, embed, head, shared, n_layers, rt):
+    def __init__(self, ckpt, args, device, embed, head, shared, n_layers, rt, draft_temperature=0.0):
         super().__init__(ckpt, args, device, embed, head, shared, n_layers)
         self.rt = rt
+        # This branch is fixed when the CUDA graph is captured. Reloading this
+        # component changes the draft policy without touching main-model weights.
+        self.draft_temperature = float(draft_temperature)
         self.S = args.max_seqs or args.max_batch_size  # sequence slots (the caches are sized by it)
         for blk in self.blocks:
             blk.attn.draft_kv = torch.zeros(self.S, self.block, args.head_dim, dtype=torch.bfloat16, device=device)
@@ -199,36 +202,47 @@ class DSparkRows(DSpark):
         o = oproj_a(o.view(R, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
         return linear_fp8(o, A.wo_b).view(R, -1)
 
-    def capture(self, S: int):
+    def capture(self, S: int, seq_start: int = 0):
         """Static buffers + one CUDA graph for draft_rows with S sequences (the draft is ~40 small launches per block)."""
+        self.seq_start = seq_start
         dev = self.device
         self.g_in = {"tokens": torch.zeros(S, dtype=torch.int64, device=dev), "pos": torch.zeros(S, dtype=torch.int64, device=dev),
-                     "mh": torch.zeros(S, 3 * self.dim, dtype=torch.bfloat16, device=dev), "wmax": torch.zeros(S, dtype=torch.int64, device=dev)}
+                     "mh": torch.zeros(S, 3 * self.dim, dtype=torch.bfloat16, device=dev), "wmax": torch.zeros(S, dtype=torch.int64, device=dev),
+                     "seq": torch.arange(S, device=dev, dtype=torch.int64) + seq_start}
         self.g_out = torch.zeros(S, self.block, dtype=torch.int64, device=dev)
         st = torch.cuda.Stream(dev)
         with torch.cuda.device(dev), torch.cuda.stream(st):
             for _ in range(2):
-                self.g_out.copy_(self._draft_rows(self.g_in["tokens"], self.g_in["pos"], self.g_in["mh"], self.g_in["wmax"]))
+                self.g_out.copy_(self._draft_rows(self.g_in["tokens"], self.g_in["pos"], self.g_in["mh"], self.g_in["wmax"], self.g_in["seq"]))
             torch.cuda.synchronize(dev)
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, stream=st, capture_error_mode="thread_local"):
-                self.g_out.copy_(self._draft_rows(self.g_in["tokens"], self.g_in["pos"], self.g_in["mh"], self.g_in["wmax"]))
+                self.g_out.copy_(self._draft_rows(self.g_in["tokens"], self.g_in["pos"], self.g_in["mh"], self.g_in["wmax"], self.g_in["seq"]))
         torch.cuda.synchronize(dev)
         self.graph = g
+        if not hasattr(self, "graphs_by_size"):
+            self.graphs_by_size = {}
+        self.graphs_by_size[S] = (g, self.g_in, self.g_out, seq_start)
 
     @torch.no_grad()
-    def draft_rows(self, tokens, pos_last, main_hidden, written_max):
-        if getattr(self, "graph", None) is not None and tokens.shape[0] == self.g_out.shape[0]:
-            self.g_in["tokens"].copy_(tokens)
-            self.g_in["pos"].copy_(pos_last)
-            self.g_in["mh"].copy_(main_hidden)
-            self.g_in["wmax"].copy_(written_max)
-            self.graph.replay()
-            return self.g_out
-        return self._draft_rows(tokens, pos_last, main_hidden, written_max)
+    def draft_rows(self, tokens, pos_last, main_hidden, written_max, seq_ids=None):
+        size = tokens.shape[0]
+        bundle = getattr(self, "graphs_by_size", {}).get(size)
+        if bundle is not None:
+            graph, inputs, output, seq_start = bundle
+            inputs["tokens"].copy_(tokens)
+            inputs["pos"].copy_(pos_last)
+            inputs["mh"].copy_(main_hidden)
+            inputs["wmax"].copy_(written_max)
+            if seq_ids is None:
+                seq_ids = torch.arange(size, device=self.device, dtype=torch.int64) + seq_start
+            inputs["seq"].copy_(seq_ids)
+            graph.replay()
+            return output
+        return self._draft_rows(tokens, pos_last, main_hidden, written_max, seq_ids)
 
     @torch.no_grad()
-    def _draft_rows(self, tokens: torch.Tensor, pos_last: torch.Tensor, main_hidden: torch.Tensor, written_max: torch.Tensor):
+    def _draft_rows(self, tokens: torch.Tensor, pos_last: torch.Tensor, main_hidden: torch.Tensor, written_max: torch.Tensor, seq_ids=None):
         """tokens [S] (the token just accepted, at position pos_last+1... i.e. t_{p+1} with p = pos_last), pos_last [S]
         (position p whose forward produced the token; the main rings hold positions <= written_max [S], only <= p are visible),
         main_hidden [S, 3*dim] (target-layer inputs at position p). Returns drafts int64 [S, block] on the device."""
@@ -237,7 +251,9 @@ class DSparkRows(DSpark):
         R = S * B
         rt = self.rt
         j = torch.arange(B, device=dev)
-        seq_row = torch.arange(S, device=dev).repeat_interleave(B)
+        if seq_ids is None:
+            seq_ids = torch.arange(S, device=dev) + getattr(self, "seq_start", 0)
+        seq_row = seq_ids.to(device=dev, dtype=torch.int64).repeat_interleave(B)
         self.slot_row = j.repeat(S)
         pos_row = (pos_last.repeat_interleave(B) + 1 + self.slot_row)
         pmax_row = written_max.repeat_interleave(B)
@@ -309,6 +325,10 @@ class DSparkRows(DSpark):
 
             logits[:, i] += markov_delta
 
-            prev = logits[:, i].argmax(-1)
+            if self.draft_temperature == 0.0:
+                prev = logits[:, i].argmax(-1)
+            else:
+                probs = torch.softmax(logits[:, i] / self.draft_temperature, dim=-1)
+                prev = (probs / torch.empty_like(probs).exponential_()).argmax(-1)
             out.append(prev)
         return torch.stack(out, dim=1)

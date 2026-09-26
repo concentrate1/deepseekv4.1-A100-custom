@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 import os
+import time
 
 from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait
 
@@ -43,8 +44,12 @@ class EPRuntime(DecodeRuntime):
     def __init__(self, model: Transformer, use_graphs: bool = True, max_batch: int | None = None):
         super().__init__(model, use_graphs=False, max_batch=max_batch)
         self.use_graphs = use_graphs
-        self.devs = [torch.device(f"cuda:{d}") for d in dict.fromkeys(b.device.index for b in model.blocks)]
-        # every device in the pipeline order; expert shards live on all of them
+        # Dense execution and expert participation are separate topologies.
+        self.dense_devs = list(self.devices)
+        self.dense_idx = {d: i for i, d in enumerate(self.dense_devs)}
+        self.input_device = model.blocks[0].device
+        self.head_device = model.blocks[-1].device
+        # Expert-only GPUs have streams/inboxes/graphs, but no dense KV mirrors.
         shards = model.blocks[0].ffn.ep
         assert shards is not None, "load the model with ep=True"
         self.shard = {sh["device"]: (sh["start"], sh["n"]) for sh in shards}
@@ -143,14 +148,14 @@ class EPRuntime(DecodeRuntime):
             self._tc_tables(B * topk, d, topk)
         self.mcast_counter = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in self.devs}
         self.graphs = {}
-        self.logits = torch.zeros(B, self.cfg["vocab_size"], dtype=torch.float32, device=self.devs[-1])
-        self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
-        self.last_layer = {d: max(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.devs}
+        self.logits = torch.zeros(B, self.cfg["vocab_size"], dtype=torch.float32, device=self.head_device)
+        self.first_layer = {d: min(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.dense_devs}
+        self.last_layer = {d: max(L for L, b in enumerate(model.blocks) if b.device == d) for d in self.dense_devs}
         self.dry = False  # dry pass: no device-side waits / signals (only to compile and load every kernel)
         # every device works on its own non-blocking stream: a cross-device memcpy on a legacy default stream
         # would synchronise with the peer's default stream and deadlock against the flag waits
         self.streams = {d: torch.cuda.Stream(d) for d in self.devs}
-        self.trace = {d: torch.zeros(nl, 16, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
+        self.trace = {d: torch.zeros(nl, 32, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
 
         # ------------------------------------------------------------
         # Exact preallocation BEFORE CUDA graph capture.
@@ -314,7 +319,7 @@ class EPRuntime(DecodeRuntime):
         lid = blk.layer_id
         if lid not in self.kv_row:
             return
-        later = [dd for dd in self.devs if self.idx[dd] > self.idx[d]]
+        later = self.dense_devs[self.dense_idx[d] + 1:]
         val, idx = self.kv_row[lid]
         for dd in later:
             p2p_copy_row(self.m.shared.compress_kv[(lid, dd)], idx, val, d, self.seq[d])
@@ -330,9 +335,13 @@ class EPRuntime(DecodeRuntime):
             h.copy_(blk.engram.apply(h, self.eng_in[L]))
         if L in self.main_hid:  # DSpark reads the attention inputs of its target layers
             self.main_hid[L].copy_(h.mean(2).view(self.B, -1))
+        self._stamp(d, L, 10)
         (pre_n, post, comb), side, x, xq, _ = self._hc_sub(blk, h, blk.hc_attn, pre, blk.attn_norm_w)
+        self._stamp(d, L, 11)
         a = self.attention2(blk.attn, x, xq, d)
+        self._stamp(d, L, 12)
         self._push_cache_rows(blk, d)
+        self._stamp(d, L, 13)
         self._hc_join(side, d)
         hc_post2_(a.view(1, -1), h, post, comb)
         self._stamp(d, L, 1)
@@ -362,13 +371,18 @@ class EPRuntime(DecodeRuntime):
         side2 = self._side_stream2(d)
         side2.wait_stream(main)
         with torch.cuda.stream(side2):
+            self._stamp(d, L, 24)
             ys = self._shared_expert(moe, xq)
+            self._stamp(d, L, 25)
+        self._stamp(d, L, 21)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
+        self._stamp(d, L, 22)
         if self.bf16_part:
             p2p_sum_rows(self.part_out[d], y_loc, d, groups=self.B)
             self.part_in[d][self.idx[d]].copy_(self.part_out[d])
         else:
             p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
+        self._stamp(d, L, 23)
         main.wait_stream(side2)
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
@@ -432,7 +446,7 @@ class EPRuntime(DecodeRuntime):
 
     def token_begin(self, d):
         hc = self.cfg["hc_mult"]
-        if d == self.devs[0]:
+        if d == self.input_device:
             with torch.cuda.device(d):
                 self.hop_h[d].copy_(F.embedding(self.tok, self.m.embed).unsqueeze(2).repeat(1, 1, hc, 1))
                 self.hop_pre[d].copy_(self.pre_identity[d])
@@ -447,12 +461,12 @@ class EPRuntime(DecodeRuntime):
         h = self.hop_h[d]
         with torch.cuda.device(d):
             if blk.device == d:
-                if L == self.first_layer[d] and self.idx[d] > 0:
+                if L == self.first_layer[d] and L > 0:
                     self._wait(self.flag_hop[d][L : L + 1], d)
                 pre = self._owner_layer(blk, d, h, self._pre[d])
                 self._pre[d] = pre
                 if L == self.last_layer[d]:
-                    if self.idx[d] + 1 < self.nd:
+                    if L + 1 < len(blocks):
                         nxt = blocks[L + 1].device
                         p2p_copy(self.hop_h[nxt], h, d)
                         p2p_copy(self.hop_pre[nxt], pre, d)
@@ -583,8 +597,11 @@ class EPRuntime(DecodeRuntime):
 
     @torch.inference_mode()
     def step(self, token, pos, seq=None, pmax=None) -> torch.Tensor:
+        _host_t0 = time.perf_counter() if self.trace is not None else None
         tok, p, sq = self.set_rows(token, pos, seq, pmax)
+        _host_t1 = time.perf_counter() if _host_t0 is not None else None
         self._engram_rows(tok, p, sq)
+        _host_t2 = time.perf_counter() if _host_t0 is not None else None
 
         _force_eager = False
 
@@ -620,6 +637,7 @@ class EPRuntime(DecodeRuntime):
                     flush=True,
                 )
 
+        _host_graph_t0 = time.perf_counter() if _host_t0 is not None else None
         if (
             self.use_graphs
             and self.graphs
@@ -630,25 +648,73 @@ class EPRuntime(DecodeRuntime):
         else:
             self._eager_token()
 
-        torch.cuda.synchronize(self.devs[-1])
+        _host_graph_t1 = time.perf_counter() if _host_t0 is not None else None
+        torch.cuda.synchronize(self.head_device)
+        for device in self.devs:
+            if device not in self.dense_idx:
+                torch.cuda.synchronize(device)
+        if _host_t0 is not None:
+            _host_t3 = time.perf_counter()
+            self.last_step_host_ms = {
+                "set_rows": (_host_t1 - _host_t0) * 1000,
+                "engram_rows": (_host_t2 - _host_t1) * 1000,
+                "pre_graph": (_host_graph_t0 - _host_t2) * 1000,
+                "graph_submit": (_host_graph_t1 - _host_graph_t0) * 1000,
+                "graph_wait": (_host_t3 - _host_graph_t1) * 1000,
+                "total": (_host_t3 - _host_t0) * 1000,
+            }
         return self.logits
 
 
 def trace_report(rt: "EPRuntime") -> str:
-    """Average per-layer timeline (us) from the DSV41_EP_TRACE stamps of the last token."""
+    """Timeline of the last verifier step, with averages and indexer-layer detail."""
     if rt.trace is None:
         return "no trace"
     tr = {d: rt.trace[d].cpu() for d in rt.devs}
     rows = []
     agg = {}
+    indexer_parts = []
     for L, blk in enumerate(rt.m.blocks):
         o = blk.device
         t = tr[o][L]
         peers = [d for d in rt.devs if d != o]
         pc = [tr[d][L, 7].item() - tr[d][L, 6].item() for d in peers]  # peer compute + push (its own clock)
-        parts = {"attn+hc": t[1] - t[0], "  hc_sub2": t[8] - t[1], "  gate+topk": t[9] - t[8], "  multicast": t[2] - t[9],
+        parts = {"attn+hc": t[1] - t[0],
+                 "  engram+hidden write": t[10] - t[0], "  hc_attn_sub": t[11] - t[10],
+                 "  attention2": t[12] - t[11], "  cache_row_push": t[13] - t[12],
+                 "  hc_attn_post": t[1] - t[13],
+                 "    qkv+window": t[16] - t[11], "    source compress": t[17] - t[16],
+                 "    indexer+cache commit": t[18] - t[17],
+                 "    sparse attention": t[19] - t[18], "    output projection": t[20] - t[19],
+                 "  hc_sub2": t[8] - t[1], "  gate+topk": t[9] - t[8], "  multicast": t[2] - t[9],
                  "own experts || shared": t[3] - t[2], "wait partials": t[4] - t[3],
+                 "  expert setup": t[21] - t[2], "  local routed experts": t[22] - t[21],
+                 "  local partial write": t[23] - t[22], "  shared join wait": t[3] - t[23],
+                 "  shared expert (overlap)": t[25] - t[24],
                  "hc_post": t[5] - t[4], "layer": t[5] - t[0], "peer compute+push (max)": max(pc), "peer compute+push (mean)": sum(pc) / len(pc)}
         for k, v in parts.items():
             agg.setdefault(k, []).append(float(v))
-    return "\n".join(f"  {k:28s} {sum(v) / len(v) / 1000:7.1f} us" for k, v in agg.items())
+        indexer = blk.attn.indexer
+        indexer_us = float(t[15] - t[14]) / 1000 if indexer is not None else 0.0
+        if indexer is not None:
+            indexer_parts.append(indexer_us)
+        index_rows = (rt.m.shared.index_k[(indexer.index_owner, o)].size(1)
+                      if indexer is not None else 0)
+        rows.append(f"  L{L:02d} gpu={o.index} indexer={int(indexer is not None)} "
+                    f"index_rows={index_rows} attn_hc_us={float(parts['attn+hc']) / 1000:.1f} "
+                    f"indexer_us={indexer_us:.1f} qkv_us={float(parts['    qkv+window']) / 1000:.1f} "
+                    f"sparse_us={float(parts['    sparse attention']) / 1000:.1f} "
+                    f"local_experts_us={float(parts['  local routed experts']) / 1000:.1f} "
+                    f"shared_expert_us={float(parts['  shared expert (overlap)']) / 1000:.1f} "
+                    f"wait_us={float(parts['wait partials']) / 1000:.1f} "
+                    f"layer_us={float(parts['layer']) / 1000:.1f}")
+    means = "\n".join(f"  {k:28s} {sum(v) / len(v) / 1000:7.1f} us" for k, v in agg.items())
+    if indexer_parts:
+        means += f"\n  {'indexer (active layers)':28s} {sum(indexer_parts) / len(indexer_parts):7.1f} us"
+    host = getattr(rt, "last_step_host_ms", None)
+    if host:
+        means += "\nlast step host wall (ms): " + " ".join(
+            f"{key}={host[key]:.2f}" for key in
+            ("set_rows", "engram_rows", "pre_graph", "graph_submit", "graph_wait", "total")
+        )
+    return means + "\nper-layer (last verifier step):\n" + "\n".join(rows)

@@ -108,35 +108,67 @@ def safe_resize(height: int, width: int, best_height: int, best_width: int, patc
     return n_llm_h, n_llm_w, best_height, best_width
 
 
+def image_byte_limit():
+    value = int(os.environ.get("DSV41_IMAGE_MAX_BYTES", str(32 * 1024 * 1024)))
+    if value <= 0:
+        raise ValueError("DSV41_IMAGE_MAX_BYTES must be positive")
+    return value
+
+
+def check_image_pixels(image):
+    limit = int(os.environ.get("DSV41_IMAGE_MAX_PIXELS", "40000000"))
+    if limit <= 0 or image.width * image.height > limit:
+        raise ValueError("image exceeds configured pixel limit")
+
+
+def _bounded_read(source, limit):
+    chunks, size = [], 0
+    while True:
+        chunk = source.read(min(65536, limit + 1 - size))
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > limit:
+            raise ValueError("image exceeds configured byte limit")
+        chunks.append(chunk)
+
+
 def load_image_bytes(record: dict) -> bytes:
-    """Load raw image bytes from base64, URL, local file path, or Anthropic source."""
+    """Local and remote debug sources are allowed, with bounded input size."""
+    limit = image_byte_limit()
+    def decode(value):
+        if not isinstance(value, str) or len(value) > 4 * ((limit + 2) // 3):
+            raise ValueError("image exceeds configured byte limit")
+        raw = base64.b64decode(value, validate=True)
+        if len(raw) > limit:
+            raise ValueError("image exceeds configured byte limit")
+        return raw
     data = record.get("data")
     if isinstance(data, bytes):
+        if len(data) > limit:
+            raise ValueError("image exceeds configured byte limit")
         return data
     if isinstance(data, str):
-        return base64.b64decode(data)
-
+        return decode(data)
     source = record.get("source")
     if isinstance(source, dict):
         if source.get("data") is not None:
-            return base64.b64decode(source["data"])
+            return decode(source["data"])
         if source.get("url"):
             return load_image_bytes({"url": source["url"]})
-
     url = record.get("url")
     if isinstance(url, str) and url:
         if url.startswith("data:"):
             header, _, payload = url.partition(",")
             if ";base64" not in header:
-                raise ValueError(f"Unsupported data URL encoding: {header}")
-            return base64.b64decode(payload)
+                raise ValueError("unsupported data URL encoding")
+            return decode(payload)
         if url.startswith(("http://", "https://")):
             with urlopen(url, timeout=30) as response:
-                return response.read()
+                return _bounded_read(response, limit)
         if os.path.exists(url):
-            with open(url, "rb") as file:
-                return file.read()
-
+            with open(url, "rb") as source:
+                return _bounded_read(source, limit)
     raise ValueError(f"Cannot load image from record: {list(record.keys())}")
 
 
@@ -157,6 +189,7 @@ def load_image(record: dict, args: Any) -> tuple[torch.Tensor, int, int, int, in
     """Load and transform an image record into normalized ViT patches [N, 3, p, p]."""
     p = args.vision_patch_size
     with Image.open(io.BytesIO(load_image_bytes(record))) as source:
+        check_image_pixels(source)
         image = source.convert("RGB")
     n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(image.width, image.height, args)
     n_vit_h, n_vit_w = best_height // p, best_width // p
@@ -375,6 +408,17 @@ class VisionTower(nn.Module):
         vit_feats = self.vision(patches, n_vit_h, n_vit_w)
         return self.aligner(vit_feats, n_vit_h, n_vit_w)
 
+    @torch.inference_mode()
+    def image_span_embeddings(self, img: ImageInput, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return all learned embeddings for one complete image token span."""
+        types = img.types.to(device)
+        span = torch.empty((types.numel(), self.image_start.numel()), device=device, dtype=dtype)
+        span[types == IMAGE_START] = self.image_start.to(device=device, dtype=dtype)
+        span[types == IMAGE_END] = self.image_end.to(device=device, dtype=dtype)
+        span[types == IMAGE_NEW_LINE] = self.image_newline.to(device=device, dtype=dtype)
+        span[types == IMAGE] = self.encode_image(img.patches, img.n_vit_h, img.n_vit_w).to(device=device, dtype=dtype)
+        return span
+
     def merge_image_embeddings(self, images: list[list[ImageInput]] | list[ImageInput], h: torch.Tensor):
         """Overwrite image token spans in token embeddings h [B, S, dim] with ViT/aligner features."""
         # Handle both flat list and nested list of samples
@@ -392,6 +436,17 @@ class VisionTower(nn.Module):
                 span[types == IMAGE_NEW_LINE] = self.image_newline.to(device=h.device, dtype=h.dtype)
                 embeds = self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
                 span[types == IMAGE] = embeds.to(device=h.device, dtype=h.dtype)
+
+
+
+def scatter_image_spans(h: torch.Tensor, spans: list[tuple[int, int, torch.Tensor]], chunk_start: int) -> None:
+    """Copy overlapping image span slices into a prefill chunk in place."""
+    chunk_end = chunk_start + h.shape[1]
+    for sample, start, encoded in spans:
+        end = start + encoded.shape[0]
+        left, right = max(chunk_start, start), min(chunk_end, end)
+        if left < right:
+            h[sample, left - chunk_start:right - chunk_start] = encoded[left - start:right - start]
 
 
 def load_vision_tower(ckpt: Any, cfg: dict, dev0: torch.device) -> VisionTower | None:

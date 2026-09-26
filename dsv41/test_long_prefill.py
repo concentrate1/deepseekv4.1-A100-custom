@@ -50,7 +50,7 @@ class LongPrefillTests(unittest.TestCase):
         rt._graph_cache_signature = rt._cache_signature()
         rt._prepare_decode_cache(4)
         self.assertTrue(rt.graphs)
-        with patch.dict(os.environ, {'DSV41_EXACT_CACHE_GROW': '1'}):
+        with patch.dict(os.environ, {'DSV41_EXACT_CACHE_GROW': '1', 'DSV41_CACHE_GROW_CHUNK': '1'}):
             rt._prepare_decode_cache(6)
         self.assertFalse(rt.graphs)
         for table in (shared.compress_kv, shared.index_k):
@@ -72,6 +72,7 @@ class LongPrefillTests(unittest.TestCase):
                 obj = model.Indexer.__new__(model.Indexer)
                 obj.ratio, obj.rope_head_dim = ratio, 0
                 obj.owns_k = False
+                obj.index_owner = 0
                 obj.device = 'cpu'
                 obj.n_heads, obj.head_dim = heads, dim
                 obj.wq_b = torch.randn(heads*dim, dim)

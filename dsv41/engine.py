@@ -18,26 +18,28 @@ import torch
 
 from .decode import DecodeRuntime
 from .load import load_model
+from .streaming import IncrementalTokenDecoder
+from . import gpu_prefix_cache
 import traceback
 
-DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash"
+DEFAULT_CKPT = os.environ.get("DSV41_CKPT", "/models/DeepSeek-V4.1-Flash")
 CKPT = os.environ.get("DSV41_CKPT", DEFAULT_CKPT)
 
 
 @dataclass
 class GenParams:
     max_new_tokens: int = 512
-    temperature: float = 0.6
+    temperature: float = 1.0
     top_p: float = 0.95
     stop: list[str] = field(default_factory=list)
     seed: int | None = None
-    repetition_penalty: float = 1.10
+    repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
-    frequency_penalty: float = 0.10
+    frequency_penalty: float = 0.0
     penalty_window: int = 256
-    progressive_penalty: float = 1.5
-    ban_cycles: bool = True
-    loop_detect: bool = True
+    progressive_penalty: float = 0.0
+    ban_cycles: bool = False
+    loop_detect: bool = False
     min_loop_match: int = 48
     min_loop_cycle: int = 1
 
@@ -48,12 +50,12 @@ _WHITESPACE_TOKEN_IDS = {200, 201, 223, 262, 271, 290}
 def apply_penalties(
     logits: torch.Tensor,
     tokens: list[int],
-    repetition_penalty: float = 1.10,
+    repetition_penalty: float = 1.0,
     presence_penalty: float = 0.0,
-    frequency_penalty: float = 0.10,
+    frequency_penalty: float = 0.0,
     window: int = 256,
-    progressive_penalty: float = 1.5,
-    ban_cycles: bool = True,
+    progressive_penalty: float = 0.0,
+    ban_cycles: bool = False,
 ) -> torch.Tensor:
     """Apply cycle suppression, progressive penalty, and repetition/frequency penalties to 1D logits."""
     if not tokens:
@@ -163,6 +165,8 @@ class _BatchRequest:
         self.next_token = 0
         self.out_tokens: list[int] = []
         self.done_event = threading.Event()
+        self.cancel_event = threading.Event()
+        self.stream_queue: queue.Queue[str] | None = None
         self.result_text = ""
         self.result_count = 0
         self.finish_reason = "stop"
@@ -170,8 +174,10 @@ class _BatchRequest:
         self.start_time = time.perf_counter()
         self.first_token_time = 0.0
         self.live_text = ""
+        self.text_decoder: IncrementalTokenDecoder | None = None
         self.slot_id = -1
         self.decode_tok_s = 0.0
+        self.disable_prefix_cache = False
 
 
 def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: torch.Generator | None) -> int:
@@ -216,11 +222,90 @@ def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: to
             return 0
 
 
+def sample_mtp_verified(
+    verify_logits: torch.Tensor,
+    drafts: list[int],
+    generated: list[int],
+    params: GenParams,
+    gen: torch.Generator | None,
+) -> tuple[int, int]:
+    """Verify drafts using the same output-history penalties as plain decode."""
+    penalty_enabled = (
+        params.repetition_penalty != 1.0
+        or params.presence_penalty != 0.0
+        or params.frequency_penalty != 0.0
+        or params.progressive_penalty > 0.0
+        or params.ban_cycles
+    )
+    # Cycle suppression examines up to 511 previous tokens; the other
+    # penalties examine only penalty_window tokens unless it is zero.
+    history = generated[-max(511, params.penalty_window):] if params.penalty_window > 0 else generated
+    for i in range(len(drafts) + 1):
+        row = verify_logits[i]
+        context = history + drafts[:i]
+        if penalty_enabled and context:
+            row = apply_penalties(
+                row, context,
+                repetition_penalty=params.repetition_penalty,
+                presence_penalty=params.presence_penalty,
+                frequency_penalty=params.frequency_penalty,
+                window=params.penalty_window,
+                progressive_penalty=params.progressive_penalty,
+                ban_cycles=params.ban_cycles,
+            )
+        token = sample_token(row, params.temperature, params.top_p, gen)
+        # No later verifier row can be accepted after the first mismatch.
+        if i == len(drafts) or token != drafts[i]:
+            return i, token
+    raise AssertionError("MTP verifier did not produce a bonus token")
+
+
+def mtp_loop_hit(tokens: list[int], params: GenParams) -> tuple[int, int, int] | None:
+    """Check exact repeated output every eight tokens to bound search cost."""
+    if not params.loop_detect or len(tokens) % 8:
+        return None
+    if len(tokens) < params.min_loop_match + params.min_loop_cycle:
+        return None
+    return detect_loop(tokens, min_match=params.min_loop_match,
+                       min_cycle=params.min_loop_cycle)
+
+
+def detached_request_error(exc):
+    """Retain an error message without pinning failed forward frames/tensors."""
+    message = str(exc)
+    traceback.clear_frames(exc.__traceback__)
+    return RuntimeError(message)
+
+
+class _RequestLocal:
+    """Keep result metadata and one-shot controls local to the calling thread."""
+    def __init__(self, default):
+        self.default = default
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        return getattr(instance._request_state, self.name, self.default) if hasattr(instance, "_request_state") else self.default
+
+    def __set__(self, instance, value):
+        if not hasattr(instance, "_request_state"):
+            instance._request_state = threading.local()
+        setattr(instance._request_state, self.name, value)
+
+
 class Engine:
+    last_finish_reason = _RequestLocal("stop")
+    last_decode_tok_s = _RequestLocal(None)
+    _disable_prefix_cache_once = _RequestLocal(False)
+
     def __init__(self, ckpt: str = CKPT, devices: list[int] | None = None, max_seq_len: int = 8192,
                  budgets: dict[int, float] | None = None, use_graphs: bool = True, thinking_mode: str = "chat",
                  offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False, ep_shards: list[int] | None = None, mtp: int = 0, mtp_device: int | None = None,
-                 max_seqs: int = 1):
+                 max_seqs: int = 1, ep_devices: list[int] | None = None):
+        self._request_state = threading.local()
         from transformers import AutoTokenizer
 
         sys.path.insert(0, os.path.join(ckpt, "encoding"))
@@ -232,6 +317,12 @@ class Engine:
         self.tok = AutoTokenizer.from_pretrained(ckpt)
         self.max_seq_len = max_seq_len
         self.mtp = int(mtp)
+        self._mtp_configured = self.mtp
+        from .dspark_config import DEFAULT_DSPARK_CONFIG_PATH, load_dspark_config
+        self.dspark_config_path = os.environ.get("DSV41_DSPARK_CONFIG", str(DEFAULT_DSPARK_CONFIG_PATH))
+        self.dspark_config = load_dspark_config(self.dspark_config_path) if self.mtp else None
+        self.dspark_version = 0
+        self._dspark_module_name = None
         # Last-request prefix reuse.
         #
         # Only exact append-only prompt growth is reused:
@@ -255,7 +346,7 @@ class Engine:
         print(f"[engine-init] max_seqs={self.max_seqs} max_decode_slots={self.max_decode_slots} max_batch={max_batch}", flush=True)
         self.model = load_model(ckpt, devices or list(range(torch.cuda.device_count())), max_seq_len=max_seq_len, max_batch=max_batch, max_seqs=self.max_seqs,
                                 budgets_gb=budgets, tokenizer=self.tok, offload_experts=offload_experts,
-                                hot_experts=hot_experts, route_stats=route_stats, ep=ep, ep_shards=ep_shards)
+                                hot_experts=hot_experts, route_stats=route_stats, ep=ep, ep_shards=ep_shards, ep_devices=ep_devices)
         if offload_experts:
             from .decode import OffloadDecodeRuntime
             self.rt = OffloadDecodeRuntime(self.model, use_graphs=use_graphs)
@@ -274,12 +365,25 @@ class Engine:
                 self.rt_b1 = DecodeRuntime(self.model, use_graphs=use_graphs, max_batch=1)
             else:
                 self.rt_b1 = None
+        self.rt_mtp_single = None
+        if self.max_seqs > 1 and self.mtp and not offload_experts:
+            runtime_cls = type(self.rt)
+            self.rt_mtp_single = runtime_cls(self.model, use_graphs=use_graphs, max_batch=1 + self.mtp)
+            self.rt_mtp_single.shared_sequence_rows = True
+            self.rt.sequence_group_size = 1 + self.mtp
+            for rows in self.rt.seq.values():
+                rows.zero_()
+            for rows in self.rt_mtp_single.seq.values():
+                rows.zero_()
         if use_graphs:
             self.rt.capture()
             if self.rt_b1 is not None:
                 print(f"[engine-init] capturing dedicated B=1 CUDA graphs...", flush=True)
                 self.rt_b1.capture()
                 print(f"[engine-init] dedicated B=1 CUDA graphs captured successfully", flush=True)
+            if self.rt_mtp_single is not None:
+                print(f"[engine-init] capturing single-request MTP B={1 + self.mtp} graphs...", flush=True)
+                self.rt_mtp_single.capture()
         self.ds = None
 
         if self.mtp:
@@ -318,6 +422,7 @@ class Engine:
                 self.model.shared,
                 len(self.model.blocks),
                 self.rt,
+                draft_temperature=self.dspark_config.draft_temperature,
             )
 
             # Tell eager prefill to retain the three target-layer
@@ -325,7 +430,12 @@ class Engine:
             self.model.collect_main_hidden = self.ds.targets
 
             # DSpark itself always has a 5-token draft block.
-            self.ds.capture(1)
+            if self.max_seqs > 1:
+                self.ds.capture(self.max_decode_slots, seq_start=1)
+                self.ds.capture(1, seq_start=1)
+            else:
+                self.ds.capture(1)
+            self.dspark_version = 1
 
             print(
                 f"[mtp] enabled drafts={self.mtp} "
@@ -341,6 +451,8 @@ class Engine:
             self.model_name = os.environ.get("DSV41_MODEL_NAME", "deepseek-v4.1-flash")
         self._jev_engine = None
         self.stats_tracker = None
+        self.phase_profile_enabled = os.environ.get("DSV41_PROFILE_PHASES", "0") == "1"
+        self.last_phase_profile: dict | None = None
         self.last_prefill_stats: dict | None = None
         self.current_phase = "idle"
         self.current_context_tokens = 0
@@ -351,6 +463,11 @@ class Engine:
         self._slot_tokens_lock = threading.Lock()
         self._last_decode_log_time = 0.0
         self.last_decode_tok_s: float | None = None
+        self.mtp_stats: dict = {
+            "enabled": bool(self.mtp), "status": "idle", "steps": 0,
+            "accepted": 0, "drafted": 0, "acceptance_pct": 0.0,
+            "accepted_per_step": 0.0, "produced_tokens": 0,
+        }
         self.last_finish_reason: str = "stop"
         slots_to_track = list(range(1, self.max_seqs)) if self.max_seqs > 1 else [0]
         for s in slots_to_track:
@@ -372,6 +489,89 @@ class Engine:
             }
         if self.max_seqs > 1:
             self._init_batch_scheduler()
+
+    def dspark_status(self) -> dict:
+        return {
+            "enabled": self.ds is not None and self.mtp > 0,
+            "version": self.dspark_version,
+            "draft_temperature": (self.dspark_config.draft_temperature
+                                  if self.dspark_config is not None else None),
+            "config_path": self.dspark_config_path,
+            "drafts": self.mtp,
+        }
+
+    def reload_dspark(self, *, reload_code: bool = True) -> dict:
+        """Replace only the DSpark weights/graph; keep the main model and verifier.
+
+        The worker's generation lock must already exclude new requests. Build
+        the replacement before changing any live references so a failed load
+        leaves the current DSpark usable.
+        """
+        if not self._mtp_configured:
+            raise RuntimeError("DSpark was not enabled when this worker started")
+        from .dspark_config import load_dspark_config
+        from .dspark_lifecycle import load_dspark_rows_class, discard_dspark_module
+        from .load import Checkpoint
+        import gc
+
+        with self.lock:
+            config = load_dspark_config(self.dspark_config_path)
+            cls, module_name = load_dspark_rows_class(reload_code=reload_code)
+            device = (self.model.blocks[-1].device if self.mtp_device is None
+                      else torch.device(f"cuda:{self.mtp_device}"))
+            candidate = None
+            previous_phase = self.current_phase
+            self.current_phase = "dspark_reload"
+            try:
+                candidate = cls(
+                    Checkpoint(self.ckpt), self.model.args, device,
+                    self.model.embed, self.model.head, self.model.shared,
+                    len(self.model.blocks), self.rt,
+                    draft_temperature=config.draft_temperature,
+                )
+                if getattr(self, "max_seqs", 1) > 1:
+                    candidate.capture(self.max_decode_slots, seq_start=1)
+                    candidate.capture(1, seq_start=1)
+                else:
+                    candidate.capture(1)
+            except BaseException:
+                discard_dspark_module(module_name)
+                del candidate
+                gc.collect()
+                raise
+            finally:
+                self.current_phase = previous_phase
+
+            old_ds = self.ds
+            old_module_name = self._dspark_module_name
+            self.ds = candidate
+            self.dspark_config = config
+            self._dspark_module_name = module_name
+            self.dspark_version += 1
+            self.mtp = self._mtp_configured
+            self.model.collect_main_hidden = tuple(candidate.targets)
+            # Checkpoints contain references to draft-ring holders. A hot
+            # reload must not restore into, or keep alive, the old DSpark.
+            for entry in getattr(self, "_rolling_prefix_entries", ()):
+                gpu_prefix_cache.drop(entry)
+            if hasattr(self, "_rolling_prefix_entries"):
+                self._rolling_prefix_entries.clear()
+            if hasattr(self, "_slot_tokens"):
+                self._slot_tokens.clear()
+            self._prefix_prompt_ids = None
+            self._prefix_len = 0
+            with self._slot_lock:
+                self.mtp_stats.update(enabled=True, status="idle", steps=0,
+                                      accepted=0, drafted=0,
+                                      acceptance_pct=0.0, accepted_per_step=0.0,
+                                      produced_tokens=0)
+            del old_ds
+            gc.collect()
+            discard_dspark_module(old_module_name)
+            print(f"[mtp] reloaded version={self.dspark_version} "
+                  f"draft_temperature={config.draft_temperature} "
+                  f"worker_pid={os.getpid()}", flush=True)
+            return self.dspark_status()
 
     def _record_prefill_stats(
         self,
@@ -447,6 +647,79 @@ class Engine:
             finally:
                 self.current_phase = "idle"
 
+    @staticmethod
+    def _completed_prefill_work(state: dict | None) -> dict | None:
+        if not state:
+            return None
+        if "completed_tokens" in state:
+            return {
+                "completed_tokens": int(state["completed_tokens"]),
+                "total_tokens": int(state["total_tokens"]),
+                "completed_chunks": int(state["completed_chunks"]),
+                "total_chunks": int(state["total_chunks"]),
+                "start_pos": int(state["start_pos"]),
+                "elapsed_s": max(0.0, time.perf_counter() - state["started_at"]),
+            }
+        completed_tokens = 0
+        completed_chunks = 0
+        for end, event in list(state["events"]):
+            try:
+                if not event.query():
+                    break
+            except Exception:
+                break
+            completed_tokens = end
+            completed_chunks += 1
+        return {
+            "completed_tokens": completed_tokens,
+            "total_tokens": state["total_tokens"],
+            "completed_chunks": completed_chunks,
+            "total_chunks": state["total_chunks"],
+            "start_pos": state["start_pos"],
+            "elapsed_s": max(0.0, time.perf_counter() - state["started_at"]),
+        }
+
+    def _set_prefill_route(self, total, reused, prefill_type):
+        """Publish the selected route, not a speculative GPU-prefix match."""
+        previous = getattr(self, "_prefill_route", None) or {}
+        self._prefill_route = {
+            "total_tokens": total, "reused_tokens": reused,
+            "prefill_type": prefill_type,
+            "started_at": previous.get("started_at", time.perf_counter()),
+        }
+        with getattr(self, "_slot_lock", threading.Lock()):
+            for state in getattr(self, "slot_states", {}).values():
+                if state.get("status") == "prefilling":
+                    state.update(reused_tokens=reused, lcp=reused,
+                                 suffix_tokens=total - reused, prefill_type=prefill_type)
+
+    def _live_prefill_work(self):
+        """Combine cold base + tail replay, or all cached suffix blocks, into one progress range."""
+        replay = getattr(self, "_prefix_replay_progress", None)
+        raw = self._completed_prefill_work(replay if replay is not None
+                                           else getattr(self.model, "_prefill_progress", None))
+        route = getattr(self, "_prefill_route", None)
+        if route is None or raw is None:
+            return raw
+        reused, total = route["reused_tokens"], route["total_tokens"]
+        completed = max(0, (raw["start_pos"] + raw["completed_tokens"] if raw else reused) - reused)
+        chunks = raw["completed_chunks"] if raw else 0
+        total_chunks = raw["total_chunks"] if raw else 0
+        if reused == 0 and replay is not None:
+            prefix_chunks = route.get("prefix_chunks", 0)
+            chunks += prefix_chunks
+            total_chunks += prefix_chunks
+        elif reused == 0 and raw and raw["total_tokens"] < total:
+            total_chunks += 1  # cold base will be followed by a guard tail
+        return {
+            "completed_tokens": min(total - reused, completed),
+            "total_tokens": total - reused,
+            "completed_chunks": chunks, "total_chunks": total_chunks,
+            "start_pos": reused, "reused_tokens": reused,
+            "prefill_type": route["prefill_type"],
+            "elapsed_s": max(0.0, time.perf_counter() - route["started_at"]),
+        }
+
     def get_cache_stats(self) -> dict:
         try:
             entries, total_bytes = self._prefix_cache_stats()
@@ -483,6 +756,7 @@ class Engine:
         combined_tok_s = 0.0
         now_t = time.perf_counter()
         with getattr(self, "_slot_lock", threading.Lock()):
+            mtp_stats = dict(self.mtp_stats)
             for s_id in sorted(getattr(self, "slot_states", {}).keys()):
                 st = dict(self.slot_states[s_id])
                 # Reset stale completed slots after 60 seconds of inactivity
@@ -492,13 +766,17 @@ class Engine:
                     st["generated_tokens"] = 0
                     st["tok_s"] = 0.0
                     self.slot_states[s_id] = st
-                if st.get("status") in ("generating", "prefilling"):
+                if st.get("status") == "generating":
                     active_cnt += 1
                     combined_tok_s += st.get("tok_s", 0.0)
                 slots_list.append(st)
 
         return {
             "prefix_entries": entries,
+            "gpu_prefix_entries": sum(bool(e.get("gpu_snapshot")) for e in
+                                      list(getattr(self, "_rolling_prefix_entries", None) or ())),
+            "gpu_prefix_bytes": sum(e.get("gpu_bytes", 0) for e in
+                                    list(getattr(self, "_rolling_prefix_entries", None) or ())),
             "prefix_bytes": total_bytes,
             "prefix_gb": round(total_bytes / (1024 ** 3), 2),
             "jev_schemas": jev_schemas,
@@ -512,16 +790,25 @@ class Engine:
             "slots": slots_list,
             "active_decode_slots": active_cnt,
             "combined_decode_tok_s": round(combined_tok_s, 1),
+            "decode_10s_tok_s": getattr(getattr(self, "stats_tracker", None), "decode_tok_s_10s", None),
+            "mtp": mtp_stats,
+            "phase_profile": getattr(self, "last_phase_profile", None),
+            "prefill_work": self._live_prefill_work()
+                if any(st.get("status") == "prefilling" for st in slots_list) else None,
             "last_prefill": getattr(self, "last_prefill_stats", None),
             "prefill_history": list(getattr(self, "prefill_history", [])),
-            "current_phase": "decode" if active_cnt > 0 else getattr(self, "current_phase", "idle"),
+            "current_phase": ("prefill" if any(st.get("status") == "prefilling" for st in slots_list)
+                              else "decode" if active_cnt > 0 else getattr(self, "current_phase", "idle")),
         }
 
     # ---------------------------------------------------------------- prompts
-    def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None) -> str:
-        return self._encode(messages, thinking_mode=thinking_mode or self.thinking_mode)
+    def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None,
+                    reasoning_effort: str | int | None = None) -> str:
+        return self._encode(messages, thinking_mode=thinking_mode or self.thinking_mode,
+                            reasoning_effort=reasoning_effort)
 
-    def format_chat(self, messages: list[dict], thinking_mode: str | None = None) -> tuple[list[int], list | None, torch.Tensor | None]:
+    def format_chat(self, messages: list[dict], thinking_mode: str | None = None,
+                    reasoning_effort: str | int | None = None) -> tuple[list[int], list | None, torch.Tensor | None]:
         """Format chat messages with multimodal image support.
         Returns: (prompt_tokens, images, token_types_tensor)."""
         from .vision import parse_tagged_text, prepare_vl_inputs, VisionConfig
@@ -538,6 +825,7 @@ class Engine:
         prompt, media_data = self._encode(
             normalized_messages,
             thinking_mode=thinking_mode or self.thinking_mode,
+            reasoning_effort=reasoning_effort,
             return_multi_modal_data=True,
         )
         images_raw = media_data.get("images", []) if isinstance(media_data, dict) else []
@@ -597,6 +885,16 @@ class Engine:
         elif "<think>" in clean_text:
             reasoning = clean_text.split("<think>", 1)[1].strip()
             clean_text = ""
+        elif (thinking_mode or self.thinking_mode) == "thinking":
+            # The prompt already ends with <think>. If generation stops before
+            # </think>, all text so far is reasoning, not visible content.
+            call_start = clean_text.find("<｜DSML｜ calls>")
+            if call_start >= 0:
+                reasoning = clean_text[:call_start].strip()
+                clean_text = clean_text[call_start:]
+            else:
+                reasoning = clean_text.strip()
+                clean_text = ""
 
         if "<｜DSML｜ calls>" in clean_text:
             idx = clean_text.find("<｜DSML｜ calls>")
@@ -1024,7 +1322,10 @@ class Engine:
                 flush=True,
             )
 
-        return slots
+        # All discovered persistent tensors have sequence as their first axis.
+        # Anchors describe only prefill slot 0, never concurrent decode slots.
+        return [(kind, holder, key, tensor if kind == "scalar_attr" else tensor[:1])
+                for kind, holder, key, tensor in slots]
 
     @torch.inference_mode()
     def _snapshot_prefix_state(self, used_tokens=None):
@@ -1156,6 +1457,11 @@ class Engine:
     def _restore_prefix_state(self, snap):
         """Restore a previously captured attention-cache snapshot."""
         touched = set()
+        # Validate the entire snapshot before touching any live state. Legacy
+        # multi-slot payloads must not be restored over current decode slots.
+        for kind, holder, key, src in snap:
+            if kind != "scalar_attr" and (src.ndim < 1 or src.shape[0] != 1):
+                raise ValueError("prefix snapshot must contain only sequence slot 0")
 
         try:
             for kind, holder, key, src in snap:
@@ -1177,6 +1483,8 @@ class Engine:
                         f"prefix snapshot target disappeared: "
                         f"{kind}:{key!r}"
                     )
+
+                dst = dst[:1]
 
                 if dst.dtype != src.dtype:
                     raise RuntimeError(
@@ -1595,6 +1903,31 @@ class Engine:
             ),
         )
 
+        # Block replay runs many separate model.forward calls. Its CUDA
+        # events describe only the current block, so publish completed suffix
+        # tokens explicitly for the dashboard instead.
+        total_chunks = max(1, (replay_total + block_size - 1) // block_size)
+        replay_progress = {
+            "total_tokens": replay_total,
+            "start_pos": start_pos,
+            "total_chunks": total_chunks,
+            "completed_tokens": 0,
+            "completed_chunks": 0,
+            "started_at": t0,
+        }
+        route = getattr(self, "_prefill_route", None)
+        if route is not None and route["reused_tokens"] == 0:
+            base_work = self._completed_prefill_work(getattr(self.model, "_prefill_progress", None))
+            route["prefix_chunks"] = base_work["total_chunks"] if base_work else 0
+        self._prefix_replay_progress = replay_progress
+
+        def mark_replay_progress(completed):
+            self._prefix_replay_progress = {
+                **replay_progress,
+                "completed_tokens": completed,
+                "completed_chunks": min(total_chunks, (completed + block_size - 1) // block_size),
+            }
+
         decode_tokens = decode_end - start_pos
 
         if (
@@ -1688,6 +2021,9 @@ class Engine:
                     n = end_pos - pos
                     done += n
                     pos = end_pos
+                    if pos < decode_end and not getattr(model, "_prefill_forward_yielded", False):
+                        self._prepare_prefill_decode()
+                        self._yield_prefill_decode()
 
                     # Synchronize only at reporting boundaries.
                     # Do NOT introduce a per-token synchronization.
@@ -1706,6 +2042,7 @@ class Engine:
                             )
 
                         now = time.perf_counter()
+                        mark_replay_progress(done)
 
                         print(
                             f"[prefix-replay-block] "
@@ -1741,14 +2078,16 @@ class Engine:
                     prompt_ids[pos]
                 )
 
-                logits = self.rt.step(
-                    token,
-                    pos,
-                )
+                replay_rt = getattr(self, "rt_b1", None) or self.rt
+                if getattr(self, "max_seqs", 1) > 1:
+                    # Full-batch scalar dispatch otherwise broadcasts into live slots.
+                    logits = replay_rt.step([token], [pos], seq=[0], pmax=[pos])
+                else:
+                    logits = replay_rt.step(token, pos)
 
                 if use_mtp_tail:
                     hidden = torch.cat([
-                        self.rt.main_hid[lid][0:1].to(self.ds.device)
+                        replay_rt.main_hid[lid][0:1].to(self.ds.device)
                         for lid in self.ds.targets
                     ], dim=-1)
                     self._write_prefix_draft_hidden(hidden, pos + 1)
@@ -1778,12 +2117,18 @@ class Engine:
                         )
 
                 done += 1
+                if (pos - start_pos + 1) % 32 == 0 and pos + 1 < decode_end:
+                    self._prepare_prefill_decode()
+                    self._yield_prefill_decode()
 
                 if (
                     done % report_every == 0
                     or pos + 1 == decode_end
                 ):
+                    if torch.is_tensor(logits) and logits.is_cuda:
+                        torch.cuda.synchronize(logits.device)
                     now = time.perf_counter()
+                    mark_replay_progress(done)
 
                     print(
                         f"[prefix-replay-decode] "
@@ -1908,7 +2253,10 @@ class Engine:
                     f"{tuple(mh.shape)}"
                 )
 
+            if torch.is_tensor(logits) and logits.is_cuda:
+                torch.cuda.synchronize(logits.device)
             now = time.perf_counter()
+            mark_replay_progress(done)
 
             print(
                 f"[prefix-replay-mtp-tail] "
@@ -1959,17 +2307,74 @@ class Engine:
 
         return path
 
-    @staticmethod
-    def _prefix_tmpfs_hash(base_ids):
-        """Stable filename derived from the cached token prefix."""
-        a = array(
-            "q",
-            (int(x) for x in base_ids),
-        )
+    def _checkpoint_cache_fingerprint(self):
+        """Invalidate persistent image KV when checkpoint files change."""
+        cached = getattr(self, "_cached_checkpoint_fingerprint", None)
+        if cached is not None:
+            return cached
+        root = str(getattr(self, "ckpt", ""))
+        digest = hashlib.sha256(os.path.realpath(root).encode())
+        try:
+            names = sorted(
+                name for name in os.listdir(root)
+                if name.endswith(".safetensors")
+                or name == "model.safetensors.index.json"
+            )
+            names.append(os.path.join("inference", "config.json"))
+            for name in names:
+                stat = os.stat(os.path.join(root, name))
+                digest.update(name.encode())
+                digest.update(array("q", (stat.st_size, stat.st_mtime_ns)).tobytes())
+        except OSError:
+            pass
+        self._cached_checkpoint_fingerprint = digest.hexdigest()
+        return self._cached_checkpoint_fingerprint
 
-        return hashlib.sha256(
-            a.tobytes()
-        ).hexdigest()[:24]
+    def _image_prefix_dir(self):
+        path = os.environ.get(
+            "DSV41_IMAGE_PREFIX_CACHE_DIR",
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache", "image-prefix"),
+        )
+        if not path:
+            return None
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            print(f"[image-prefix] disk cache disabled: {exc}", flush=True)
+            return None
+        return path
+
+    @staticmethod
+    def _image_cache_identity(images, token_types):
+        """Fingerprint the pixels and layout that actually enter the model."""
+        digest = hashlib.sha256(b"dsv41-image-prefix-v1")
+        last_image_end = 0
+        for sample_no, sample in enumerate(images or ()):
+            for image in sample or ():
+                patches = image.patches.detach().cpu().contiguous()
+                types = image.types.detach().cpu().contiguous()
+                metadata = (sample_no, int(image.start), int(image.n_vit_h),
+                            int(image.n_vit_w), *tuple(int(x) for x in patches.shape),
+                            *tuple(int(x) for x in types.shape))
+                digest.update(array("q", metadata).tobytes())
+                digest.update(str(patches.dtype).encode("ascii"))
+                digest.update(patches.view(torch.uint8).numpy().tobytes())
+                digest.update(types.view(torch.uint8).numpy().tobytes())
+                last_image_end = max(last_image_end, int(image.start) + types.numel())
+        if last_image_end == 0 or token_types is None:
+            raise ValueError("image cache requires image spans and token types")
+        prefix_types = token_types[:, :last_image_end].detach().cpu().contiguous()
+        digest.update(prefix_types.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest(), last_image_end
+
+    @staticmethod
+    def _prefix_tmpfs_hash(base_ids, image_key=None):
+        """Stable filename derived from the token prefix and visual identity."""
+        a = array("q", (int(x) for x in base_ids))
+        digest = hashlib.sha256(a.tobytes())
+        if image_key is not None:
+            digest.update(image_key.encode("ascii"))
+        return digest.hexdigest()[:24]
 
     @staticmethod
     def _prefix_slot_signature(slot):
@@ -2024,7 +2429,7 @@ class Engine:
         SSD.  The live restore path still uses the in-process pinned
         tensors and does not read this file unless the server restarts.
         """
-        root = self._prefix_tmpfs_dir()
+        root = self._image_prefix_dir() if ent.get("image_key") else self._prefix_tmpfs_dir()
 
         if root is None:
             return
@@ -2036,7 +2441,7 @@ class Engine:
 
         base_ids = ent["base_ids"]
 
-        h = self._prefix_tmpfs_hash(base_ids)
+        h = self._prefix_tmpfs_hash(base_ids, ent.get("image_key"))
 
         final_path = os.path.join(
             root,
@@ -2071,7 +2476,10 @@ class Engine:
             if kind == "dict" and h.ndim >= 2 and h.shape[1] > block_rows:
                 refs = []
                 for start in range(0, h.shape[1], block_rows):
-                    blk = h[:, start:start + block_rows].contiguous()
+                    # A contiguous slice can still share the entire parent
+                    # storage; torch.save would then write tens of MB for a
+                    # ~1 MB block. clone() gives each block exact storage.
+                    blk = h[:, start:start + block_rows].clone()
                     digest = hashlib.sha256(blk.view(torch.uint8).numpy().tobytes()).hexdigest()[:32]
                     path = os.path.join(block_root, digest + ".pt")
                     if not os.path.exists(path):
@@ -2104,6 +2512,9 @@ class Engine:
             "created_at": time.time(),
             "prompt_ids": list(ent["prompt_ids"]),
             "base_ids": list(base_ids),
+            "image_key": ent.get("image_key"),
+            "image_cache_version": 1 if ent.get("image_key") else None,
+            "checkpoint_fingerprint": self._checkpoint_cache_fingerprint() if ent.get("image_key") else None,
             "bytes": int(ent["bytes"]),
             "slot_signatures": slot_signatures,
             "tensors": tensors,
@@ -2234,7 +2645,7 @@ class Engine:
                 if os.environ.get("DSV41_PREFIX_BLOCK_GC", "1") == "1":
                     self._gc_prefix_blocks(root)
 
-        self._prune_prefix_tmpfs()
+        self._prune_prefix_tmpfs(root)
 
     @staticmethod
     def _gc_prefix_blocks(root):
@@ -2278,9 +2689,9 @@ class Engine:
                 flush=True,
             )
 
-    def _prune_prefix_tmpfs(self):
-        """Bound tmpfs usage using the same entry/count style limits."""
-        root = self._prefix_tmpfs_dir()
+    def _prune_prefix_tmpfs(self, root=None):
+        """Bound persisted prefix snapshots in their selected storage root."""
+        root = root or self._prefix_tmpfs_dir()
 
         if root is None:
             return
@@ -2303,25 +2714,16 @@ class Engine:
         except Exception:
             return
 
-        max_entries = max(
-            1,
-            int(
-                os.environ.get(
-                    "DSV41_PREFIX_TMPFS_ENTRIES",
-                    os.environ.get(
-                        "DSV41_PREFIX_CACHE_ENTRIES",
-                        "512",
-                    ),
-                )
-            ),
-        )
-
-        max_gb = float(
-            os.environ.get(
-                "DSV41_PREFIX_TMPFS_GB",
-                "512",
-            )
-        )
+        image_root = root == self._image_prefix_dir()
+        if image_root:
+            max_entries = max(1, int(os.environ.get("DSV41_IMAGE_PREFIX_CACHE_ENTRIES", "8")))
+            max_gb = float(os.environ.get("DSV41_IMAGE_PREFIX_CACHE_GB", "8"))
+        else:
+            max_entries = max(1, int(os.environ.get(
+                "DSV41_PREFIX_TMPFS_ENTRIES",
+                os.environ.get("DSV41_PREFIX_CACHE_ENTRIES", "512"),
+            )))
+            max_gb = float(os.environ.get("DSV41_PREFIX_TMPFS_GB", "512"))
 
         max_bytes = int(
             max_gb * 2**30
@@ -2329,38 +2731,43 @@ class Engine:
 
         total = 0
         keep = []
+        removed = False
 
         for path in paths:
             try:
                 sz = os.path.getsize(path)
-            except OSError:
-                continue
+                if image_root:
+                    # Image manifests deduplicate large immutable blocks, so
+                    # physical manifest bytes understate logical cache usage.
+                    payload = torch.load(path, map_location="cpu", weights_only=False)
+                    sz = int(payload.get("bytes", sz))
+            except Exception:
+                try:
+                    sz = os.path.getsize(path)
+                except OSError:
+                    continue
 
-            if (
-                len(keep) < max_entries
-                and total + sz <= max_bytes
-            ):
+            if len(keep) < max_entries and total + sz <= max_bytes:
                 keep.append(path)
                 total += sz
                 continue
 
             try:
                 os.unlink(path)
-
-                print(
-                    f"[prefix-tmpfs] EVICT "
-                    f"path={path}",
-                    flush=True,
-                )
-            except Exception:
+                removed = True
+                print(f"[prefix-store] EVICT path={path}", flush=True)
+            except OSError:
                 pass
+        if removed:
+            self._gc_prefix_blocks(root)
 
     def _load_prefix_cache_from_tmpfs(
         self,
         entries,
+        root=None,
     ):
         """Load saved snapshots after a Python process restart."""
-        root = self._prefix_tmpfs_dir()
+        root = root or self._prefix_tmpfs_dir()
 
         if root is None:
             return
@@ -2409,22 +2816,13 @@ class Engine:
             )
         )
 
-        max_entries = max(
-            1,
-            int(
-                os.environ.get(
-                    "DSV41_PREFIX_CACHE_ENTRIES",
-                    "16",
-                )
-            ),
-        )
-
-        max_gb = float(
-            os.environ.get(
-                "DSV41_PREFIX_CACHE_GB",
-                "64",
-            )
-        )
+        image_root = root == self._image_prefix_dir()
+        if image_root:
+            max_entries = max(1, int(os.environ.get("DSV41_IMAGE_PREFIX_CACHE_ENTRIES", "8")))
+            max_gb = float(os.environ.get("DSV41_IMAGE_PREFIX_CACHE_GB", "8"))
+        else:
+            max_entries = max(1, int(os.environ.get("DSV41_PREFIX_CACHE_ENTRIES", "16")))
+            max_gb = float(os.environ.get("DSV41_PREFIX_CACHE_GB", "64"))
 
         max_bytes = int(
             max_gb * 2**30
@@ -2535,6 +2933,14 @@ class Engine:
                 skipped += 1
                 continue
 
+            if payload.get("image_key") and (
+                payload.get("image_cache_version") != 1
+                or payload.get("checkpoint_fingerprint") != self._checkpoint_cache_fingerprint()
+            ):
+                print(f"[image-prefix] SKIP reason=checkpoint-or-version path={path}", flush=True)
+                skipped += 1
+                continue
+
             saved_sig = payload.get(
                 "slot_signatures",
                 [],
@@ -2579,6 +2985,7 @@ class Engine:
 
             snap = []
             bad = False
+            bad_detail = ""
 
             for current_slot, src in zip(
                 current_slots,
@@ -2619,15 +3026,23 @@ class Engine:
                 ):
                     try:
                         owner = key[0] if isinstance(key, tuple) else None
-                        table_kind = "index_k" if "index_k" in str(key) or "index_k" in str(holder) else "compress_kv"
                         shared = getattr(self.model, "shared", None)
-                        if shared and hasattr(shared, "grow_cache_rows") and owner is not None:
-                            shared.grow_cache_rows(table_kind, owner, src.shape[1])
+                        table_kind = (
+                            "index_k" if shared is not None and holder is getattr(shared, "index_k", None)
+                            else "compress_kv" if shared is not None and holder is getattr(shared, "compress_kv", None)
+                            else None
+                        )
+                        if table_kind and hasattr(shared, "_ensure_capacity") and owner is not None:
                             table = getattr(shared, table_kind, None)
-                            if table and key in table:
-                                dst = table[key]
+                            if table is not None and key in table:
+                                shared._ensure_capacity(table, owner, src.shape[1], table_kind)
+                                dst = table[key][:1]
                     except Exception as grow_err:
-                        pass
+                        print(
+                            f"[prefix-tmpfs] GROW-FAILED kind={table_kind} "
+                            f"owner={owner} rows={src.shape[1]} error={grow_err}",
+                            flush=True,
+                        )
 
                 _shape_ok = (
                     torch.is_tensor(src)
@@ -2646,6 +3061,11 @@ class Engine:
                 )
                 if not _shape_ok:
                     bad = True
+                    bad_detail = (
+                        f"slot={len(snap)} kind={kind} key={key!r} "
+                        f"src={tuple(src.shape) if torch.is_tensor(src) else type(src).__name__} "
+                        f"dst={tuple(dst.shape) if torch.is_tensor(dst) else type(dst).__name__}"
+                    )
                     break
 
                 # Restore HOT cache tensors as pinned host RAM when
@@ -2676,7 +3096,7 @@ class Engine:
             if bad:
                 print(
                     f"[prefix-tmpfs] SKIP "
-                    f"reason=tensor-layout "
+                    f"reason=tensor-layout {bad_detail} "
                     f"path={path}",
                     flush=True,
                 )
@@ -2707,13 +3127,11 @@ class Engine:
                 "base_ids": list(
                     payload["base_ids"]
                 ),
+                "image_key": payload.get("image_key"),
                 "snapshot": snap,
                 "bytes": nbytes,
-                "last_used": float(
-                    payload.get(
-                        "created_at",
-                        time.time(),
-                    )
+                "last_used": time.monotonic() - max(
+                    0.0, time.time() - float(payload.get("created_at", time.time()))
                 ),
                 "hits": 0,
                 "persist_path": path,
@@ -2765,41 +3183,70 @@ class Engine:
             # Mark before loading to avoid accidental recursion.
             self._prefix_tmpfs_loaded = True
 
-            self._load_prefix_cache_from_tmpfs(
-                entries
-            )
+            self._load_prefix_cache_from_tmpfs(entries)
+            image_dir = self._image_prefix_dir()
+            if image_dir and image_dir != self._prefix_tmpfs_dir():
+                self._load_prefix_cache_from_tmpfs(entries, root=image_dir)
 
         return entries
 
     def _find_prefix_cache_entry(
         self,
         prompt_ids,
+        image_key=None,
     ):
-        """Find the deepest cached base that is an exact prefix.
+        """Prefer a resident GPU anchor, then the deepest matching CPU base.
 
         This allows unrelated Claude/LiteLLM request families to coexist
         instead of constantly replacing one global last-request cache.
         """
         entries = self._prefix_cache_entries()
 
+        gpu_enabled = gpu_prefix_cache.enabled(self)
+        if gpu_enabled:
+            gpu_prefix_cache.trim(entries)
+
         best = None
-        best_base = 0
+        best_rank = (-1, 0)
 
         for ent in entries:
+            if ent.get("image_key") != image_key:
+                continue
             base_ids = ent["base_ids"]
             n = len(base_ids)
 
-            if n <= best_base:
+            # A checkpoint at the prompt end has no next-token logits. Never
+            # rewind its rings by one token; use an earlier exact checkpoint.
+            if n <= 0 or len(prompt_ids) <= n:
                 continue
 
-            if len(prompt_ids) < n:
-                continue
-
-            if prompt_ids[:n] == base_ids:
+            rank = (int(gpu_enabled and bool(ent.get("gpu_snapshot"))), n)
+            if rank > best_rank and prompt_ids[:n] == base_ids:
                 best = ent
-                best_base = n
+                best_rank = rank
 
         return best
+
+    def _restore_prefix_entry(self, entry, total):
+        """Restore a committed anchor; rejected MTP rows never enter this pool."""
+        gpu = entry.get("gpu_snapshot") if gpu_prefix_cache.enabled(self) else None
+        route = "gpu_snapshot" if gpu else "host_replay"
+        self._set_prefill_route(total, len(entry["base_ids"]), route)
+        if gpu:
+            try:
+                self._restore_prefix_state(gpu)
+                return route
+            except RuntimeError:
+                # A partial restore touched only scratch slot 0. Overwrite it
+                # completely from the matching CPU checkpoint before replay.
+                gpu_prefix_cache.drop(entry)
+                self._set_prefill_route(total, len(entry["base_ids"]), "host_replay")
+        self._restore_prefix_state(entry["snapshot"])
+        return "host_replay"
+
+    def _promote_prefix_entry(self, entry):
+        if gpu_prefix_cache.enabled(self):
+            gpu_prefix_cache.promote(self._prefix_cache_entries(), entry)
 
     def _store_prefix_cache_entry(
         self,
@@ -2809,6 +3256,7 @@ class Engine:
         snapshot,
         snapshot_bytes,
         previous=None,
+        image_key=None,
     ):
         # Do not rewrite an identical stable base.
         #
@@ -2820,9 +3268,17 @@ class Engine:
             if (
                 _prev_base is not None
                 and list(_prev_base) == list(base_ids)
+                and previous.get("image_key") == image_key
             ):
                 previous["prompt_ids"] = list(prompt_ids)
-                previous["last_used"] = time.time()
+                previous["last_used"] = time.monotonic()
+                if image_key and previous.get("persist_path"):
+                    try:
+                        path = previous["persist_path"]
+                        if time.time() - os.stat(path).st_mtime >= 3600:
+                            os.utime(path, None)
+                    except OSError:
+                        pass
                 previous["hits"] = int(
                     previous.get("hits", 0)
                 ) + 1
@@ -2834,6 +3290,7 @@ class Engine:
                     flush=True,
                 )
 
+                self._promote_prefix_entry(previous)
                 return previous
 
         """Insert/update one prefix snapshot and enforce LRU bounds."""
@@ -2844,6 +3301,7 @@ class Engine:
         ent = {
             "prompt_ids": list(prompt_ids),
             "base_ids": list(base_ids),
+            "image_key": image_key,
             "snapshot": snapshot,
             "bytes": int(snapshot_bytes),
             "last_used": now,
@@ -2857,61 +3315,40 @@ class Engine:
         if previous is not None:
             try:
                 entries.remove(previous)
+                gpu_prefix_cache.drop(previous)
             except ValueError:
                 pass
 
         entries.append(ent)
 
-        max_entries = max(
-            1,
-            int(
-                os.environ.get(
-                    "DSV41_PREFIX_CACHE_ENTRIES",
-                    "64",
-                )
-            ),
-        )
-
-        max_gb = float(
-            os.environ.get(
-                "DSV41_PREFIX_CACHE_GB",
-                "128",
-            )
-        )
-
-        max_bytes = int(max_gb * (2**30))
-
-        # Oldest first.
-        entries.sort(
-            key=lambda x: x["last_used"]
-        )
-
-        total_bytes = sum(
-            e["bytes"]
-            for e in entries
-        )
-
-        while (
-            len(entries) > max_entries
-            or total_bytes > max_bytes
-        ):
-            victim = entries.pop(0)
-            total_bytes -= victim["bytes"]
-
-            print(
-                f"[prefix-cache] EVICT "
-                f"base={len(victim['base_ids']):,} "
-                f"size={victim['bytes']/2**20:,.1f}MiB",
-                flush=True,
-            )
-            if self.stats_tracker is not None:
-                try:
-                    self.stats_tracker.record_cache_event(
-                        f"Prefix cache evict: base={len(victim['base_ids']):,} tokens ({victim['bytes']/2**20:.1f} MiB)",
-                        event_type="evict",
-                    )
-                except Exception:
-                    pass
+        # Keep independent hot-RAM quotas: text traffic must not evict every
+        # image snapshot that is still retained in the disk image cache.
+        entries.sort(key=lambda x: x["last_used"])
+        for wants_image in (False, True):
+            if wants_image:
+                max_entries = max(1, int(os.environ.get("DSV41_IMAGE_PREFIX_CACHE_ENTRIES", "8")))
+                max_bytes = int(float(os.environ.get("DSV41_IMAGE_PREFIX_CACHE_GB", "8")) * 2**30)
+            else:
+                max_entries = max(1, int(os.environ.get("DSV41_PREFIX_CACHE_ENTRIES", "64")))
+                max_bytes = int(float(os.environ.get("DSV41_PREFIX_CACHE_GB", "128")) * 2**30)
+            family = [e for e in entries if bool(e.get("image_key")) == wants_image]
+            family_bytes = sum(e["bytes"] for e in family)
+            while len(family) > max_entries or family_bytes > max_bytes:
+                victim = family.pop(0)
+                entries.remove(victim)
+                gpu_prefix_cache.drop(victim)
+                family_bytes -= victim["bytes"]
+                print(f"[prefix-cache] EVICT base={len(victim['base_ids']):,} "
+                      f"size={victim['bytes']/2**20:,.1f}MiB", flush=True)
+                if self.stats_tracker is not None:
+                    try:
+                        self.stats_tracker.record_cache_event(
+                            f"Prefix cache evict: base={len(victim['base_ids']):,} tokens ({victim['bytes']/2**20:.1f} MiB)",
+                            event_type="evict",
+                        )
+                    except Exception:
+                        pass
+        total_bytes = sum(e["bytes"] for e in entries)
 
         print(
             f"[prefix-cache] STORE "
@@ -2925,6 +3362,7 @@ class Engine:
             ent,
             previous=previous,
         )
+        self._promote_prefix_entry(ent)
 
         if self.stats_tracker is not None:
             try:
@@ -2938,7 +3376,9 @@ class Engine:
         return ent
 
     def _prefix_cache_stats(self):
-        entries = self._prefix_cache_entries()
+        # Metrics must not lazily load snapshots: import may grow GPU caches,
+        # and the metrics thread does not own the generation lock.
+        entries = list(getattr(self, "_rolling_prefix_entries", None) or ())
 
         total = sum(
             e["bytes"]
@@ -3046,6 +3486,7 @@ class Engine:
             reuse_pos = (best_lcp // 16) * 16
 
         suffix_len = total - reuse_pos
+        self._set_prefill_route(total, reuse_pos, "gpu_hit")
         print(
             f"[gpu-slot-cache] HIT best_slot={best_slot} "
             f"lcp={best_lcp:,}/{total:,} ({best_lcp/total*100:.1f}%) "
@@ -3082,6 +3523,110 @@ class Engine:
 
         return logits, reuse_pos
 
+    def _prefill_with_image_cache(self, prompt_ids, images, token_types, *, cache_disabled=False):
+        """Reuse an image-conditioned KV anchor only after every image span."""
+        total = len(prompt_ids)
+        image_key, image_end = self._image_cache_identity(images, token_types)
+        guard = max(32, int(os.environ.get("DSV41_PREFIX_GUARD", "256")))
+        target_base = max(image_end, total - guard)
+        cacheable = not cache_disabled and 0 < target_base < total
+        t0 = time.perf_counter()
+
+        if cacheable:
+            entry = self._find_prefix_cache_entry(prompt_ids, image_key=image_key)
+            if entry is not None:
+                old_base = len(entry["base_ids"])
+                if image_end <= old_base < total:
+                    try:
+                        cache_route = self._restore_prefix_entry(entry, total)
+                        refresh_after = max(guard, int(os.environ.get("DSV41_PREFIX_REFRESH_TOKENS", "2048")))
+                        next_base = max(old_base, target_base) if total - old_base >= refresh_after else old_base
+                        snapshot_at = next_base if old_base < next_base < total else None
+                        logits, new_snapshot = self._replay_prefix_tail(
+                            prompt_ids, old_base, snapshot_at=snapshot_at,
+                        )
+                        if logits is None:
+                            raise RuntimeError("image prefix replay produced no logits")
+                        if new_snapshot is not None:
+                            snap, snap_bytes = new_snapshot
+                            self._store_prefix_cache_entry(
+                                prompt_ids=prompt_ids, base_ids=prompt_ids[:next_base],
+                                snapshot=snap, snapshot_bytes=snap_bytes,
+                                previous=entry, image_key=image_key,
+                            )
+                        else:
+                            self._store_prefix_cache_entry(
+                                prompt_ids=prompt_ids, base_ids=entry["base_ids"],
+                                snapshot=entry["snapshot"], snapshot_bytes=entry["bytes"],
+                                previous=entry, image_key=image_key,
+                            )
+                        dt = time.perf_counter() - t0
+                        replayed = total - old_base
+                        print(f"[vision-prefix] HIT reused={old_base:,} replayed={replayed:,} "
+                              f"total={total:,} time={dt:.3f}s", flush=True)
+                        self._record_prefill_stats(
+                            "LCP-HIT", total, old_base, replayed, dt,
+                            prefill_type=cache_route, lcp=old_base,
+                            base_tokens=old_base, suffix_tokens=replayed,
+                        )
+                        return logits, old_base
+                    except Exception as exc:
+                        print(f"[vision-prefix] RESTORE-FAILED {exc}; rebuilding", flush=True)
+                        traceback.print_exc()
+                        try:
+                            self._prefix_cache_entries().remove(entry)
+                        except ValueError:
+                            pass
+
+        self._prefix_replay_progress = None
+        self.model._prefill_progress = None
+        self._set_prefill_route(total, 0, "cold_vision")
+        dev0 = self.model.blocks[0].device
+        if cacheable:
+            base_ids = prompt_ids[:target_base]
+            base_types = token_types[:, :target_base]
+            logits = self.model.forward(
+                torch.tensor([base_ids], dtype=torch.long, device=dev0), 0,
+                images=images, token_types=base_types,
+            )
+            if torch.is_tensor(logits) and logits.is_cuda:
+                torch.cuda.synchronize(logits.device)
+            if getattr(self, "ds", None) is not None:
+                self._write_prefix_draft_hidden(self.model.main_hidden, target_base)
+            snap, snap_bytes = self._snapshot_prefix_state(used_tokens=target_base)
+            replay_logits, _ = self._replay_prefix_tail(
+                prompt_ids, target_base, snapshot_at=None,
+            )
+            if replay_logits is not None:
+                logits = replay_logits
+            self._store_prefix_cache_entry(
+                prompt_ids=prompt_ids, base_ids=base_ids,
+                snapshot=snap, snapshot_bytes=snap_bytes,
+                previous=None, image_key=image_key,
+            )
+            print(f"[vision-prefix] STORE base={target_base:,} guard={total-target_base:,} "
+                  f"key={image_key[:12]}", flush=True)
+        else:
+            logits = self.model.forward(
+                torch.tensor([prompt_ids], dtype=torch.long, device=dev0), 0,
+                images=images, token_types=token_types,
+            )
+            if torch.is_tensor(logits) and logits.is_cuda:
+                torch.cuda.synchronize(logits.device)
+            print(f"[vision-prefix] BYPASS reason={'disabled' if cache_disabled else 'image-at-tail'} "
+                  f"tokens={total:,}", flush=True)
+
+        dt = time.perf_counter() - t0
+        print(f"[vision-prefill] full-prefill tokens={total:,} time={dt:.3f}s "
+              f"tok_s={total/max(dt,1e-9):,.1f}", flush=True)
+        self._prefix_prompt_ids = None
+        self._prefix_len = 0
+        self._record_prefill_stats(
+            "cold_vision", total, 0, total, dt,
+            prefill_type="cold_vision",
+        )
+        return logits, 0
+
     @torch.inference_mode()
     def _prefill_with_prefix_reuse(
         self,
@@ -3089,61 +3634,23 @@ class Engine:
         images=None,
         token_types=None,
     ):
-        if images is not None:
-            _t0 = time.perf_counter()
-            dev0 = self.model.blocks[0].device
-            logits = self.model.forward(
-                torch.tensor([prompt_ids], dtype=torch.long, device=dev0),
-                0,
-                images=images,
-                token_types=token_types,
-            )
-            if torch.is_tensor(logits) and logits.is_cuda:
-                torch.cuda.synchronize(logits.device)
-            _dt = time.perf_counter() - _t0
-            _n = len(prompt_ids)
-            print(
-                f"[vision-prefill] full-prefill tokens={_n:,} "
-                f"time={_dt:.3f}s "
-                f"tok_s={_n/max(_dt,1e-9):,.1f}",
-                flush=True,
-            )
-            self._remember_prefill_prefix(prompt_ids)
-            self._record_prefill_stats(
-                mode="cold_vision",
-                total=_n,
-                reused=0,
-                new_tokens=_n,
-                dt=_dt,
-                prefill_type="cold_vision",
-            )
-            return logits, 0
-
-        # ------------------------------------------------------------
-        # Debug correctness switch.
-        #
-        # Completely bypass prefix snapshots / continuation replay and
-        # perform a normal start_pos=0 full prefill.
-        #
-        #   DSV41_DISABLE_PREFIX_CACHE=1
-        #
-        # This is intentionally checked before any cache lookup/restore.
-        # ------------------------------------------------------------
+        self.model._prefill_progress = None
+        self._prefix_replay_progress = None
+        self._prefill_route = None
+        self._set_prefill_route(len(prompt_ids), 0, "cold_vision" if images is not None else "cold")
         _disable_prefix_cache = (
-            os.environ.get(
-                "DSV41_DISABLE_PREFIX_CACHE",
-                "0",
-            ) == "1"
-            or bool(
-                getattr(
-                    self,
-                    "_disable_prefix_cache_once",
-                    False,
-                )
-            )
+            os.environ.get("DSV41_DISABLE_PREFIX_CACHE", "0") == "1"
+            or bool(getattr(self, "_disable_prefix_cache_once", False))
         )
-
         self._disable_prefix_cache_once = False
+        if images is not None:
+            self._prefix_prompt_ids = None
+            self._prefix_len = 0
+            with self._slot_tokens_lock:
+                self._slot_tokens[0] = [-1]
+            return self._prefill_with_image_cache(
+                prompt_ids, images, token_types, cache_disabled=_disable_prefix_cache,
+            )
 
         if _disable_prefix_cache:
             _t0 = time.perf_counter()
@@ -3170,6 +3677,7 @@ class Engine:
                 f"tok_s={_n/max(_dt,1e-9):,.1f}",
                 flush=True,
             )
+            self._record_prefill_stats("FULL", _n, 0, _n, _dt, prefill_type="cold")
 
             return logits, 0
 
@@ -3207,6 +3715,9 @@ class Engine:
         # ------------------------------------------------------------
         use_gpu_cache = (
             os.environ.get("DSV41_GPU_PREFIX_CACHE", "1") != "0"
+            # Batched speculation leaves unaccepted rows in live slot rings.
+            # Live slots are unsafe; batch MTP uses immutable GPU/host anchors below.
+            and not (getattr(self, "max_seqs", 1) > 1 and getattr(self, "mtp", 0))
         )
         min_gpu_prefix = int(
             os.environ.get("DSV41_GPU_PREFIX_MIN", "64")
@@ -3228,6 +3739,9 @@ class Engine:
                     flush=True,
                 )
                 traceback.print_exc()
+                self._set_prefill_route(total, 0, "cold")
+                self._prefix_replay_progress = None
+                self.model._prefill_progress = None
 
         # Search ALL retained host-RAM snapshots.
         entry = self._find_prefix_cache_entry(
@@ -3256,6 +3770,8 @@ class Engine:
         lcp_prompt = None
 
         for candidate in self._prefix_cache_entries():
+            if candidate.get("image_key") is not None:
+                continue
             cp = candidate["prompt_ids"]
 
             c = self._prompt_lcp(
@@ -3283,6 +3799,7 @@ class Engine:
         # HIT: restore stable base and replay only its tail.
         # ========================================================
         if reusable:
+            cache_route = self._restore_prefix_entry(entry, total)
             print(
                 f"[prefix-cache] LCP-HIT "
                 f"old={len(old_prompt):,} "
@@ -3291,10 +3808,6 @@ class Engine:
                 f"base={old_base:,} "
                 f"replay={total-old_base:,}",
                 flush=True,
-            )
-
-            self._restore_prefix_state(
-                old_snapshot
             )
 
             # Do NOT roll the snapshot forward on every request.
@@ -3544,7 +4057,7 @@ class Engine:
                 old_base,
                 replay_n,
                 dt,
-                prefill_type="host_replay",
+                prefill_type=cache_route,
                 lcp=lcp,
                 base_tokens=old_base,
                 suffix_tokens=replay_n,
@@ -3766,6 +4279,8 @@ class Engine:
             yield from self.generate(prompt_ids, p, images=images, token_types=token_types)
             return
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
+        if max_new <= 0:
+            raise ValueError("no token budget remains for generation")
         # Claude may request 32K output even for a 100K+ context. Keep
         # long-context requests bounded so the gateway can finish instead
         # of timing out during slow single-token decode. Override per host.
@@ -3779,13 +4294,17 @@ class Engine:
         with self.lock:
             self.current_phase = "prefill"
             self.current_context_tokens = len(prompt_ids)
+            self.last_phase_profile = None
+            mtp_generation = bool(self.mtp)
             try:
-                if self.mtp and images is None:
+                if mtp_generation:
                     yield from self._generate_mtp_locked(
                         prompt_ids,
                         p,
                         max_new,
                         gen,
+                        images=images,
+                        token_types=token_types,
                     )
                     return
 
@@ -3795,11 +4314,11 @@ class Engine:
                     token_types=token_types,
                 )
                 with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                    self._slot_tokens[0] = list(prompt_ids)
+                    self._slot_tokens[0] = [-1] if images is not None else list(prompt_ids)
                 self.current_phase = "decode"
                 pos = len(prompt_ids)
                 out: list[int] = []
-                decoded_upto = 0
+                text_decoder = IncrementalTokenDecoder(self.tok)
                 pending = ""
                 t0_single = time.perf_counter()
                 last_single_log = t0_single
@@ -3816,6 +4335,8 @@ class Engine:
                     st["recent_text"] = ""
                     st["tok_s"] = 0.0
                     self.slot_states[0] = st
+                phase = ({"mode": "plain", "steps": 0, "sample_ms": 0.0,
+                          "target_ms": 0.0} if self.phase_profile_enabled else None)
                 for step in range(max_new):
                     step_logits = logits[0]
                     if out and (
@@ -3835,7 +4356,10 @@ class Engine:
                             progressive_penalty=p.progressive_penalty,
                             ban_cycles=p.ban_cycles,
                         )
+                    sample_t0 = time.perf_counter() if phase is not None else None
                     t = sample_token(step_logits, p.temperature, p.top_p, gen)
+                    if phase is not None:
+                        phase["sample_ms"] += (time.perf_counter() - sample_t0) * 1000
                     if t == self.eos:
                         print(
                          f"[generate] STOP=eos step={step} pos={pos} "
@@ -3852,15 +4376,12 @@ class Engine:
                             self.stats_tracker.record_decode_tokens(1)
                         except Exception:
                             pass
-                    # decode incrementally; hold back a partial multi-byte character
-                    text = self.tok.decode(out[decoded_upto:])
-                    if "\ufffd" in text:
-                        piece = ""
-                    else:
-                        piece, decoded_upto = text, len(out)
+                    # Bound how long malformed UTF-8 can hold back the stream.
+                    piece = text_decoder.push(t)
                     now_single = time.perf_counter()
                     dt_single = max(now_single - t0_single, 1e-4)
-                    tok_s_single = round(len(out) / dt_single, 1)
+                    # The first token comes from prefill logits, before decode starts.
+                    tok_s_single = round(max(len(out) - 1, 0) / dt_single, 1)
                     with getattr(self, "_slot_lock", threading.Lock()):
                         st = self.slot_states.get(0, {})
                         st["generated_tokens"] = len(out)
@@ -3899,26 +4420,40 @@ class Engine:
                                         if 0 in self._slot_tokens:
                                             self._slot_tokens[0] = self._slot_tokens[0][:-trim_count]
                                 return
+                    target_t0 = time.perf_counter() if phase is not None else None
                     logits = self.rt.step(t, pos)
+                    if phase is not None:
+                        phase["target_ms"] += (time.perf_counter() - target_t0) * 1000
+                        phase["steps"] += 1
+                        self.last_phase_profile = dict(phase)
                     pos += 1
-                if out[decoded_upto:]:
-                    tail = self.tok.decode(out[decoded_upto:])
-                    if tail:
-                        yield out[-1], tail
+                tail = text_decoder.flush()
+                if tail:
+                    yield out[-1], tail
             finally:
                 self.current_phase = "idle"
-                dt_final = max(time.perf_counter() - t0_single, 1e-4) if "t0_single" in locals() else 0.0
-                with getattr(self, "_slot_lock", threading.Lock()):
-                    if 0 in self.slot_states:
+                if mtp_generation:
+                    with self._slot_lock:
                         st = self.slot_states[0]
                         st["status"] = "completed"
-                        st["generated_tokens"] = len(out) if "out" in locals() else 0
-                        st["tok_s"] = round(len(out) / dt_final, 1) if ("out" in locals() and dt_final > 0) else 0.0
-                        st["elapsed_s"] = round(dt_final, 2)
-                        st["recent_text"] = self.tok.decode(out[-1500:], errors="replace") if ("out" in locals() and out) else ""
                         st["completed_at"] = time.perf_counter()
-                if "out" in locals() and dt_final > 0:
-                    self.last_decode_tok_s = round(len(out) / dt_final, 1)
+                        self.mtp_stats["status"] = "completed"
+                        self.last_decode_tok_s = st.get("tok_s", 0.0)
+                        self.last_finish_reason = "length" if st.get("generated_tokens", 0) >= max_new else "stop"
+                else:
+                    dt_final = max(time.perf_counter() - t0_single, 1e-4) if "t0_single" in locals() else 0.0
+                    with getattr(self, "_slot_lock", threading.Lock()):
+                        if 0 in self.slot_states:
+                            st = self.slot_states[0]
+                            st["status"] = "completed"
+                            st["generated_tokens"] = len(out) if "out" in locals() else 0
+                            st["tok_s"] = round(max(len(out) - 1, 0) / dt_final, 1) if ("out" in locals() and dt_final > 0) else 0.0
+                            st["elapsed_s"] = round(dt_final, 2)
+                            st["recent_text"] = self.tok.decode(out[-1500:], errors="replace") if ("out" in locals() and out) else ""
+                            st["completed_at"] = time.perf_counter()
+                    if "out" in locals() and dt_final > 0:
+                        self.last_decode_tok_s = round(max(len(out) - 1, 0) / dt_final, 1)
+                        self.last_finish_reason = "length" if len(out) >= max_new else "stop"
 
     def _generate_mtp_locked(
         self,
@@ -3926,6 +4461,8 @@ class Engine:
         p: GenParams,
         max_new: int,
         gen: torch.Generator | None,
+        images=None,
+        token_types=None,
     ) -> Iterator[tuple[int, str]]:
         """Single-sequence DSpark speculative decoding.
 
@@ -3960,8 +4497,18 @@ class Engine:
         # Prefill
         # ------------------------------------------------------------
 
+        with self._slot_lock:
+            st = self.slot_states[0]
+            st.update(status="prefilling", req_id="single-mtp",
+                      prompt_tokens=len(prompt_ids), generated_tokens=0,
+                      max_tokens=max_new, recent_text="", tok_s=0.0,
+                      elapsed_s=0.0, start_time=time.perf_counter())
+            self.mtp_stats.update(status="prefilling", steps=0, accepted=0,
+                                  drafted=0, acceptance_pct=0.0,
+                                  accepted_per_step=0.0, produced_tokens=0)
+
         logits, prefix_reused = self._prefill_with_prefix_reuse(
-            prompt_ids
+            prompt_ids, images=images, token_types=token_types
         )
 
         T = len(prompt_ids)
@@ -4055,23 +4602,34 @@ class Engine:
 
         self.current_phase = "decode"
         out: list[int] = []
-        decoded_upto = 0
+        text_decoder = IncrementalTokenDecoder(self.tok)
         pending = ""
         produced = 0
 
         n_verify_steps = 0
         n_accepted = 0
+        n_drafted = 0
+        decode_start = time.perf_counter()
+        recent_text = ""
+        with self._slot_lock:
+            st = self.slot_states[0]
+            st.update(status="generating", start_time=decode_start,
+                      first_tok_time=decode_start)
+            self.mtp_stats["status"] = "generating"
 
         def emit(tokens):
-            nonlocal decoded_upto
             nonlocal pending
             nonlocal produced
+            nonlocal recent_text
 
             for t in tokens:
                 if produced >= max_new:
                     return True
 
                 if t == self.eos:
+                    tail = text_decoder.flush()
+                    if tail:
+                        yield out[-1], tail
                     print(
                         f"[generate] STOP=eos "
                         f"produced={produced} "
@@ -4082,17 +4640,41 @@ class Engine:
 
                 out.append(int(t))
                 produced += 1
+                loop_res = mtp_loop_hit(out, p)
+                if loop_res is not None:
+                    cycle_len, _, prev_pos = loop_res
+                    print(
+                        f"[generate] STOP=repetition-loop cycle={cycle_len} "
+                        f"produced={produced} prev_pos={prev_pos}",
+                        flush=True,
+                    )
+                    # The current token has not been streamed yet; prior
+                    # pieces cannot be retracted from an SSE response.
+                    out.pop()
+                    produced -= 1
+                    tail = text_decoder.flush()
+                    if tail:
+                        yield out[-1], tail
+                    return True
+                if self.stats_tracker is not None:
+                    try:
+                        self.stats_tracker.record_decode_tokens(1)
+                    except Exception:
+                        pass
 
-                text = self.tok.decode(
-                    out[decoded_upto:]
-                )
+                piece = text_decoder.push(t)
 
-                if "�" in text:
-                    piece = ""
-                else:
-                    piece = text
-                    decoded_upto = len(out)
-
+                now_decode = time.perf_counter()
+                elapsed = max(now_decode - decode_start, 1e-4)
+                if piece:
+                    recent_text = (recent_text + piece)[-1500:]
+                with self._slot_lock:
+                    st = self.slot_states[0]
+                    st["generated_tokens"] = produced
+                    st["tok_s"] = round(max(produced - 1, 0) / elapsed, 1)
+                    st["elapsed_s"] = round(elapsed, 2)
+                    st["recent_text"] = recent_text
+                    self.mtp_stats["produced_tokens"] = produced
                 if piece:
                     pending += piece
 
@@ -4126,8 +4708,14 @@ class Engine:
         # Speculative loop
         # ------------------------------------------------------------
 
+        phase = ({"mode": "mtp", "steps": 0, "draft_read_ms": 0.0,
+                  "prepare_ms": 0.0, "verify_ms": 0.0,
+                  "write_submit_ms": 0.0, "sample_ms": 0.0}
+                 if self.phase_profile_enabled else None)
+        if phase is not None:
+            self.last_phase_profile = dict(phase)
         while produced < max_new:
-
+            draft_t0 = time.perf_counter() if phase is not None else None
             try:
                 draft_all = ds.draft_rows(
                     torch.tensor(
@@ -4171,6 +4759,9 @@ class Engine:
                 .to("cpu")
                 .tolist()
             )
+            if phase is not None:
+                phase["draft_read_ms"] += (time.perf_counter() - draft_t0) * 1000
+                prepare_t0 = time.perf_counter()
 
             K = 1 + len(drafts)
 
@@ -4279,12 +4870,18 @@ class Engine:
                     flush=True,
                 )
 
+            verify_t0 = time.perf_counter() if phase is not None else None
+            if phase is not None:
+                phase["prepare_ms"] += (verify_t0 - prepare_t0) * 1000
             verify_logits = rt.step(
                 row_tokens,
                 positions,
                 seq=[0] * K,
                 pmax=[pmax] * K,
             )
+            if phase is not None:
+                phase["verify_ms"] += (time.perf_counter() - verify_t0) * 1000
+                write_t0 = time.perf_counter()
 
             if os.environ.get(
                 "DSV41_DEBUG_MTP_SYNC",
@@ -4322,56 +4919,53 @@ class Engine:
                 ),
             )
 
-            # Sample verifier outputs exactly as the ordinary engine
-            # would sample them.
-            verified = [
-                sample_token(
-                    verify_logits[i],
-                    p.temperature,
-                    p.top_p,
-                    gen,
-                )
-                for i in range(K)
-            ]
-
-            acc = 0
-
-            for i, draft in enumerate(drafts):
-                if verified[i] == draft:
-                    acc += 1
-                else:
-                    break
+            if phase is not None:
+                phase["write_submit_ms"] += (time.perf_counter() - write_t0) * 1000
+                sample_t0 = time.perf_counter()
+            # Sample each verifier row with the history it conditions on.
+            # Stop at the first mismatch; the last row is the bonus token.
+            acc, bonus = sample_mtp_verified(
+                verify_logits, drafts, out, p, gen,
+            )
+            if phase is not None:
+                phase["sample_ms"] += (time.perf_counter() - sample_t0) * 1000
+                phase["steps"] += 1
+                self.last_phase_profile = dict(phase)
 
             # Accepted drafts followed by the verifier's first
             # non-draft token (or the bonus token after all accepted).
-            new_tokens = drafts[:acc] + [verified[acc]]
+            new_tokens = drafts[:acc] + [bonus]
 
             n_verify_steps += 1
             n_accepted += acc
+            n_drafted += len(drafts)
+            with self._slot_lock:
+                self.mtp_stats.update(
+                    steps=n_verify_steps, accepted=n_accepted,
+                    drafted=n_drafted,
+                    acceptance_pct=round(100 * n_accepted / max(n_drafted, 1), 1),
+                    accepted_per_step=round(n_accepted / n_verify_steps, 2),
+                )
 
             # Row `acc` is the forward pass which produced the new
             # bonus token.
             main_h = mh_all[acc].clone()
 
-            # mtp_run.py uses this same logical state update.
+            # Keep logical sequence state aligned with the accepted tokens.
             old_p = p_last
             p_last = old_p + 1 + acc
             written_max = old_p + K
 
-            current = verified[acc]
+            current = bonus
 
             stopped = yield from emit(new_tokens)
 
             if stopped:
                 return
 
-        if out[decoded_upto:]:
-            tail = self.tok.decode(
-                out[decoded_upto:]
-            )
-
-            if tail:
-                yield out[-1], tail
+        tail = text_decoder.flush()
+        if tail:
+            yield out[-1], tail
 
         if n_verify_steps:
             print(
@@ -4383,7 +4977,7 @@ class Engine:
             )
 
     @torch.inference_mode()
-    def generate_text(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> tuple[str, int]:
+    def generate_text(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, cancel_event=None) -> tuple[str, int]:
         if self.max_seqs <= 1:
             pieces, n = [], 0
             for _, piece in self.generate(prompt_ids, p, images=images, token_types=token_types):
@@ -4391,9 +4985,13 @@ class Engine:
                 n += 1
             return "".join(pieces), n
 
-        return self._generate_text_batched(prompt_ids, p, images=images, token_types=token_types)
+        return self._generate_text_batched(prompt_ids, p, images=images, token_types=token_types, cancel_event=cancel_event)
 
     def _init_batch_scheduler(self):
+        self.prefill_interleave_stats = {"slices": 0, "decode_steps": 0, "decode_tokens": 0,
+                                        "deferred_for_cache": 0}
+        self.model._prefill_prepare_decode = self._prepare_prefill_decode
+        self.model._prefill_yield_decode = self._yield_prefill_decode
         self._batch_queue: queue.Queue[_BatchRequest] = queue.Queue()
         self._batch_stop_event = threading.Event()
         # Decode slots are 1 .. max_seqs - 1 (slot 0 is reserved for prefill scratchpad)
@@ -4407,16 +5005,262 @@ class Engine:
             flush=True,
         )
 
+    def _prefill_decode_runtime(self):
+        """The two-slot profile has at most one active request while the other prefills."""
+        active = getattr(self, "_active_slots", {})
+        if (os.environ.get("DSV41_COOPERATIVE_PREFILL", "1") != "1"
+                or len(active) != 1 or getattr(self, "_cooperating_prefill", False)):
+            return None
+        if self.mtp:
+            return getattr(self, "rt_mtp_single", None)
+        return getattr(self, "rt_b1", None)
+
+    def _sync_prefill_devices(self):
+        devices = {block.device for block in self.model.blocks}
+        devices.update(getattr(getattr(self, "rt", None), "devs", ()))
+        if getattr(self, "ds", None) is not None:
+            devices.add(self.ds.device)
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    def _prepare_prefill_decode(self, end_pos=None):
+        """Refresh decode graphs after growth, before pipeline activations are allocated."""
+        rt = self._prefill_decode_runtime()
+        if rt is None:
+            return
+        req = next(iter(self._active_slots.values()))
+        self._sync_prefill_devices()
+        rt._prepare_decode_cache(max(req.pos + rt.B, end_pos or 0))
+        self._prefill_last_decode_yield = time.perf_counter()
+
+    def _yield_prefill_decode(self, min_interval_s=None):
+        """Cooperatively advance the old request at a completed prefill boundary."""
+        rt = self._prefill_decode_runtime()
+        if rt is None:
+            return
+        req = next(iter(self._active_slots.values()))
+        # Do not allocate/recapture a graph while pipeline activations are live.
+        # Normal decode will handle any further growth once prefill completes.
+        if rt._cache_signature() != getattr(rt, "_graph_cache_signature", None):
+            self.prefill_interleave_stats["deferred_for_cache"] += 1
+            return
+        shared = self.model.shared
+        saved = {name: getattr(shared, name) for name in
+                 ("_current_chunk_idx", "kv_owner", "index_owner") if hasattr(shared, name)}
+        phase = self.current_phase
+        before = len(req.out_tokens)
+        self._sync_prefill_devices()
+        now = time.perf_counter()
+        elapsed = max(0.0, now - getattr(self, "_prefill_last_decode_yield", now))
+        if min_interval_s is not None and elapsed < min_interval_s:
+            return False
+        steps_before = self.prefill_interleave_stats["decode_steps"]
+        self._cooperating_prefill = True
+        try:
+            budget = max(0.01, float(os.environ.get("DSV41_PREFILL_DECODE_BUDGET_S", "2.0")))
+            if min_interval_s is not None:
+                budget = min(budget, elapsed)
+            deadline = time.perf_counter() + budget
+            self.prefill_interleave_stats["slices"] += 1
+            while self._active_slots and time.perf_counter() < deadline:
+                req = next(iter(self._active_slots.values()))
+                end_pos = req.pos + rt.B
+                if any(table[key].shape[1] < end_pos // self.model.blocks[key[0]].attn.ratio + 1
+                       for table in (shared.compress_kv, shared.index_k) for key in table):
+                    self.prefill_interleave_stats["deferred_for_cache"] += 1
+                    break
+                # The callback must not use padded slot 0 or a different graph
+                # near the logical limit while slot 0 holds prefill state.
+                if self.mtp and req.pos + self.ds.block >= self.max_seq_len:
+                    break
+                self._decode_active_once()
+                self.prefill_interleave_stats["decode_steps"] += 1
+        finally:
+            try:
+                self._sync_prefill_devices()
+            finally:
+                for name, value in saved.items():
+                    setattr(shared, name, value)
+                self.current_phase = phase
+                self._cooperating_prefill = False
+                self._prefill_last_decode_yield = time.perf_counter()
+                self.prefill_interleave_stats["decode_tokens"] += max(0, len(req.out_tokens) - before)
+                with self._slot_lock:
+                    self.mtp_stats["status"] = "prefilling"
+        return self.prefill_interleave_stats["decode_steps"] > steps_before
+
+    def _seed_batch_mtp(self, req, slot_id):
+        """Seed a dedicated draft ring from slot 0's completed prefill."""
+        ds = self.ds
+        hidden = self.model.main_hidden.reshape(-1, 3 * ds.dim)
+        tail = hidden[-ds.win:]
+        end = len(req.prompt_ids)
+        # Prefix prefill may have written earlier chunks to the scratch ring.
+        for block in ds.blocks:
+            block.attn.window_kv_cache[slot_id].copy_(block.attn.window_kv_cache[0])
+        ds.write_main_rows(tail, torch.full((len(tail),), slot_id, device=ds.device),
+                           torch.arange(end - len(tail), end, device=ds.device))
+        req.main_h = hidden[-1].to(ds.device).clone()
+        req.written_max = end - 1
+        del self.model.main_hidden
+
+    def _batch_context_tail_step(self, active_ids):
+        """Use one valid row near the context boundary, with no out-of-range draft/padding."""
+        rt, ds = self.rt_b1, self.ds
+        result = []
+        self.last_batch_verify_rows = 1
+        for sid in active_ids:
+            req = self._active_slots[sid]
+            high_water = max(req.pos, req.written_max)
+            logits = rt.step([req.next_token], [req.pos], seq=[sid], pmax=[high_water])
+            hidden = torch.cat([rt.main_hid[lid][:1].to(ds.device) for lid in ds.targets], dim=-1)
+            ds.write_main_rows(hidden, torch.tensor([sid], device=ds.device),
+                               torch.tensor([req.pos], device=ds.device))
+            req.main_h = hidden[0].clone()
+            req.written_max = high_water
+            _, token = sample_mtp_verified(logits, [], req.out_tokens, req.params, req.gen)
+            result.append([token])
+        return result
+
+    def _batch_mtp_step(self, active_ids):
+        """Draft all decode slots, then verify all active sequences in one batch."""
+        ds, rt = self.ds, self.rt
+        if ds is None:
+            raise RuntimeError("batch MTP requires a loaded DSpark")
+        grouped = bool(getattr(rt, "sequence_group_size", 0))
+        if grouped and any(self._active_slots[sid].pos + ds.block >= self.max_seq_len for sid in active_ids):
+            return self._batch_context_tail_step(active_ids)
+        single_rt = getattr(self, "rt_mtp_single", None)
+        single = (ds is not None and len(active_ids) == 1 and single_rt is not None
+                  and self._active_slots[active_ids[0]].pos + ds.block < self.max_seq_len)
+        if single:
+            rt = single_rt
+        self.last_batch_verify_rows = rt.B
+        if ds is None:
+            raise RuntimeError("batch MTP requires a loaded DSpark")
+        count = self.max_decode_slots
+        tokens = torch.zeros(count, dtype=torch.long, device=ds.device)
+        positions = torch.zeros_like(tokens)
+        written = torch.zeros_like(tokens)
+        hidden = torch.zeros(count, 3 * ds.dim, dtype=torch.bfloat16, device=ds.device)
+        for sid in active_ids:
+            req = self._active_slots[sid]
+            # The draft head always emits five rows; keep all RoPE indices in range.
+            if req.pos + ds.block < self.max_seq_len:
+                tokens[sid - 1] = req.next_token
+                positions[sid - 1] = req.pos - 1
+                written[sid - 1] = req.written_max
+                hidden[sid - 1].copy_(req.main_h)
+        if single:
+            sid = active_ids[0]
+            row = sid - 1
+            drafted = ds.draft_rows(tokens[row:row + 1], positions[row:row + 1],
+                                    hidden[row:row + 1], written[row:row + 1],
+                                    seq_ids=torch.tensor([sid], device=ds.device)).cpu().tolist()
+            drafts_all = {sid - 1: drafted[0]}
+        else:
+            drafts_all = ds.draft_rows(tokens, positions, hidden, written).cpu().tolist()
+        row_tokens, row_pos, row_seq, row_max = [], [], [], []
+        plans = []
+        for sid in active_ids:
+            req = self._active_slots[sid]
+            remaining = req.max_new - len(req.out_tokens)
+            n = self.mtp if single or grouped else min(self.mtp, max(0, remaining - 1), self.max_seq_len - req.pos - 1)
+            if req.pos + ds.block >= self.max_seq_len:
+                n = 0
+            drafts = drafts_all[sid - 1][:n]
+            start = len(row_tokens)
+            k = 1 + len(drafts)
+            plans.append((sid, start, k, drafts))
+            row_tokens.extend([req.next_token] + drafts)
+            row_pos.extend(range(req.pos, req.pos + k))
+            row_seq.extend([sid] * k)
+            row_max.extend([req.pos + k - 1] * k)
+        used = len(row_tokens)
+        # Scratch-slot padding uses distinct positions, avoiding duplicate KV writes.
+        pad = rt.B - used
+        if single and (pad or len(set(row_seq)) != 1):
+            raise RuntimeError("single-request MTP runtime requires all rows in one slot")
+        row_tokens.extend([0] * pad)
+        row_pos.extend(range(pad))
+        row_seq.extend([0] * pad)
+        row_max.extend([max(0, pad - 1)] * pad)
+        if grouped:
+            group = 1 + self.mtp
+            if any(len(set(row_seq[i:i + group])) != 1 for i in range(0, rt.B, group)):
+                raise RuntimeError("grouped MTP indexer requires one sequence per verifier group")
+        logits = rt.step(row_tokens, row_pos, seq=row_seq, pmax=row_max)
+        mh = torch.cat([rt.main_hid[lid][:used].to(ds.device) for lid in ds.targets], dim=-1)
+        ds.write_main_rows(mh, torch.tensor(row_seq[:used], device=ds.device),
+                           torch.tensor(row_pos[:used], device=ds.device))
+        results = []
+        accepted = drafted = 0
+        for sid, start, k, drafts in plans:
+            req = self._active_slots[sid]
+            acc, bonus = sample_mtp_verified(logits[start:start + k], drafts,
+                                             req.out_tokens, req.params, req.gen)
+            req.main_h = mh[start + acc].clone()
+            req.written_max = req.pos + k - 1
+            results.append(drafts[:acc] + [bonus])
+            accepted += acc
+            drafted += len(drafts)
+        with self._slot_lock:
+            stats = self.mtp_stats
+            stats["status"] = "generating"
+            stats["steps"] += len(plans)
+            stats["accepted"] += accepted
+            stats["drafted"] += drafted
+            stats["acceptance_pct"] = round(100 * stats["accepted"] / max(stats["drafted"], 1), 1)
+            stats["accepted_per_step"] = round(stats["accepted"] / max(stats["steps"], 1), 2)
+        return results
+
+    def _cancel_batch_request(self, req):
+        """Release a request only at a scheduler boundary, after GPU work returns."""
+        sid = req.slot_id
+        if sid in self._active_slots and self._active_slots[sid] is req:
+            self._active_slots.pop(sid)
+            if sid not in self._free_decode_slots:
+                self._free_decode_slots.append(sid)
+            with self._slot_lock:
+                self.slot_states[sid] = {"slot_id": sid, "status": "cancelled"}
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            getattr(self, "_slot_tokens", {}).pop(sid, None)
+        req.images = req.token_types = None
+        req.main_h = None
+        req.finish_reason = "cancelled"
+        if not self._active_slots:
+            self.current_phase = "idle"
+        req.done_event.set()
+
+    def _discard_cancelled_queued(self):
+        # Filter under Queue's mutex to preserve FIFO order for live requests.
+        with self._batch_queue.mutex:
+            cancelled, live = [], []
+            for req in self._batch_queue.queue:
+                (cancelled if req.cancel_event.is_set() else live).append(req)
+            self._batch_queue.queue.clear()
+            self._batch_queue.queue.extend(live)
+        for req in cancelled:
+            self._cancel_batch_request(req)
+
     @torch.inference_mode()
     def _batch_worker_loop(self):
         B = self.rt.B
         while not self._batch_stop_event.is_set():
+            self._discard_cancelled_queued()
+            for req in list(self._active_slots.values()):
+                if req.cancel_event.is_set():
+                    self._cancel_batch_request(req)
             # 1. Prefill pending requests into available decode slots
             while self._free_decode_slots and not self._batch_queue.empty():
                 try:
                     req = self._batch_queue.get_nowait()
                 except queue.Empty:
                     break
+
+                if req.cancel_event.is_set():
+                    self._cancel_batch_request(req)
+                    continue
 
                 # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
                 best_gpu_slot, best_gpu_lcp = (0, 0) if req.images is not None else self._find_best_gpu_slot(req.prompt_ids)
@@ -4427,17 +5271,22 @@ class Engine:
                     slot_id = self._free_decode_slots.pop(0)
 
                 req.slot_id = slot_id
+                self.current_phase = "prefill"
+                self.current_context_tokens = len(req.prompt_ids)
+                self.model._prefill_progress = None
+                self._prefix_replay_progress = None
+                self._prefill_route = None
                 with self._slot_lock:
                     st = self.slot_states.get(slot_id, {})
                     st["slot_id"] = slot_id
                     st["status"] = "prefilling"
                     st["req_id"] = req.req_id
                     st["prompt_tokens"] = len(req.prompt_ids)
-                    st["reused_tokens"] = best_gpu_lcp
-                    st["reused_slot"] = best_gpu_slot
-                    st["lcp"] = best_gpu_lcp
-                    st["prefill_type"] = "gpu_hit" if best_gpu_lcp > 0 else "cold"
-                    st["suffix_tokens"] = max(0, len(req.prompt_ids) - best_gpu_lcp)
+                    st["reused_tokens"] = 0
+                    st["reused_slot"] = None
+                    st["lcp"] = 0
+                    st["prefill_type"] = "cold"
+                    st["suffix_tokens"] = len(req.prompt_ids)
                     st["generated_tokens"] = 0
                     st["max_tokens"] = req.max_new
                     st["start_time"] = time.perf_counter()
@@ -4449,13 +5298,19 @@ class Engine:
                 try:
                     with self.lock:
                         # Prefill using slot 0 (fully compatible with prefix-cache / snapshots / GPU cache)
+                        self._disable_prefix_cache_once = req.disable_prefix_cache
                         logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids, images=req.images, token_types=req.token_types)
                         first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
                         # Copy per-sequence cache state from slot 0 to target decode slot
                         self.rt.copy_seq(0, slot_id, req_id=req.req_id)
+                        if self.mtp:
+                            self._seed_batch_mtp(req, slot_id)
                         with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                            self._slot_tokens[0] = list(req.prompt_ids)
-                            self._slot_tokens[slot_id] = list(req.prompt_ids)
+                            # Image spans use identical token IDs for different
+                            # pixels. Never advertise their KV as reusable.
+                            tracked = [-1] if req.images is not None else list(req.prompt_ids)
+                            self._slot_tokens[0] = list(tracked)
+                            self._slot_tokens[slot_id] = list(tracked)
                         pf_stats = getattr(self, "last_prefill_stats", None)
                         with self._slot_lock:
                             st = self.slot_states.get(slot_id, {})
@@ -4469,16 +5324,17 @@ class Engine:
                             self.slot_states[slot_id] = st
                         req.pos = len(req.prompt_ids)
                         req.next_token = first_tok
-                        if first_tok == self.eos:
-                            req.result_text = ""
-                            req.result_count = 0
+                        if first_tok == self.eos or req.max_new == 1:
+                            req.result_text = "" if first_tok == self.eos else self.tok.decode([first_tok], errors="replace")
+                            req.result_count = 0 if first_tok == self.eos else 1
+                            req.finish_reason = "stop" if first_tok == self.eos else "length"
                             req.done_event.set()
                             self._free_decode_slots.append(slot_id)
                             with self._slot_lock:
                                 st = self.slot_states.get(slot_id, {})
                                 st["status"] = "completed"
-                                st["generated_tokens"] = 0
-                                st["recent_text"] = ""
+                                st["generated_tokens"] = req.result_count
+                                st["recent_text"] = req.result_text
                                 st["completed_at"] = time.perf_counter()
                                 self.slot_states[slot_id] = st
                             print(f"[batched-engine] prompt immediately reached EOS for slot={slot_id}", flush=True)
@@ -4488,8 +5344,11 @@ class Engine:
                                 if slot_id in self._slot_tokens:
                                     self._slot_tokens[slot_id].append(first_tok)
                             req.first_token_time = time.perf_counter()
-                            first_piece = self.tok.decode([first_tok], errors="replace")
+                            req.text_decoder = IncrementalTokenDecoder(self.tok)
+                            first_piece = req.text_decoder.push(first_tok)
                             req.live_text = first_piece
+                            if first_piece and req.stream_queue is not None:
+                                req.stream_queue.put(first_piece)
                             self._active_slots[slot_id] = req
                             with self._slot_lock:
                                 st = self.slot_states.get(slot_id, {})
@@ -4502,6 +5361,13 @@ class Engine:
                 except Exception as e:
                     print(f"[batched-engine] prefill error on slot={slot_id}: {e}", flush=True)
                     traceback.print_exc()
+                    try:
+                        self._sync_prefill_devices()
+                    except Exception:
+                        pass
+                    request_error = detached_request_error(e)
+                    req.images = None
+                    req.token_types = None
                     if "out of memory" in str(e).lower() and torch.cuda.is_available():
                         for d in range(torch.cuda.device_count()):
                             try:
@@ -4509,7 +5375,7 @@ class Engine:
                                     torch.cuda.empty_cache()
                             except Exception:
                                 pass
-                    req.error = e
+                    req.error = request_error
                     req.done_event.set()
                     self._free_decode_slots.append(slot_id)
                     with getattr(self, "_slot_tokens_lock", threading.Lock()):
@@ -4519,6 +5385,8 @@ class Engine:
                         st = self.slot_states.get(slot_id, {})
                         st["status"] = "idle"
                         self.slot_states[slot_id] = st
+                finally:
+                    self.current_phase = "decode" if self._active_slots else "idle"
 
             # 2. Decode active slots in batch
             if not self._active_slots:
@@ -4526,24 +5394,85 @@ class Engine:
                 continue
 
             with self.lock:
-                active_ids = list(self._active_slots.keys())
-                n_active = len(active_ids)
+                self._decode_active_once()
 
-                # Adaptive decode dispatch:
-                # If only 1 request is active and dedicated B=1 runtime is available,
-                # execute on B=1 graph to achieve ~60+ tok/s (no MoE sorting/bucketing overhead).
-                if n_active == 1 and self.rt_b1 is not None:
-                    s_id = active_ids[0]
+    @torch.inference_mode()
+    def _decode_active_once(self):
+        """One decode iteration; caller owns self.lock, including prefill callbacks."""
+        for req in list(self._active_slots.values()):
+            if req.cancel_event.is_set():
+                self._cancel_batch_request(req)
+        if not self._active_slots:
+            return
+        B = self.rt.B
+        active_ids = list(self._active_slots.keys())
+        n_active = len(active_ids)
+
+        if self.mtp:
+            try:
+                token_batches = self._batch_mtp_step(active_ids)
+            except Exception as exc:
+                traceback.print_exc()
+                for sid in active_ids:
+                    req = self._active_slots.pop(sid)
+                    req.error = detached_request_error(exc)
+                    req.done_event.set()
+                    self._free_decode_slots.append(sid)
+                    with self._slot_tokens_lock:
+                        self._slot_tokens.pop(sid, None)
+                    with self._slot_lock:
+                        self.slot_states[sid]["status"] = "idle"
+                return
+        else:
+            # Adaptive decode dispatch:
+            # If only 1 request is active and dedicated B=1 runtime is available,
+            # execute on B=1 graph to achieve ~60+ tok/s (no MoE sorting/bucketing overhead).
+            if n_active == 1 and self.rt_b1 is not None:
+                s_id = active_ids[0]
+                req = self._active_slots[s_id]
+                try:
+                    logits = self.rt_b1.step([req.next_token], [req.pos], seq=[s_id], pmax=[req.pos])
+                except Exception as exc:
+                    print(f"[batched-engine] single-decode step error: {exc}", flush=True)
+                    traceback.print_exc()
+                    req.error = detached_request_error(exc)
+                    req.done_event.set()
+                    self._free_decode_slots.append(s_id)
+                    del self._active_slots[s_id]
+                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                        if s_id in self._slot_tokens:
+                            del self._slot_tokens[s_id]
+                    with self._slot_lock:
+                        st = self.slot_states.get(s_id, {})
+                        st["status"] = "idle"
+                        self.slot_states[s_id] = st
+                    return
+            else:
+                toks, poss, seqs, pmaxs = [], [], [], []
+                for s_id in active_ids:
                     req = self._active_slots[s_id]
-                    try:
-                        logits = self.rt_b1.step([req.next_token], [req.pos], seq=[s_id], pmax=[req.pos])
-                    except Exception as exc:
-                        print(f"[batched-engine] single-decode step error: {exc}", flush=True)
-                        traceback.print_exc()
-                        req.error = exc
+                    toks.append(req.next_token)
+                    poss.append(req.pos)
+                    seqs.append(s_id)
+                    pmaxs.append(req.pos)
+
+                # Padding to fixed batch size B with slot 0 (dummy rows)
+                for _ in range(B - n_active):
+                    toks.append(0)
+                    poss.append(0)
+                    seqs.append(0)
+                    pmaxs.append(0)
+
+                try:
+                    logits = self.rt.step(toks, poss, seq=seqs, pmax=pmaxs)
+                except Exception as exc:
+                    print(f"[batched-engine] decode step error: {exc}", flush=True)
+                    traceback.print_exc()
+                    for s_id in active_ids:
+                        req = self._active_slots[s_id]
+                        req.error = detached_request_error(exc)
                         req.done_event.set()
                         self._free_decode_slots.append(s_id)
-                        del self._active_slots[s_id]
                         with getattr(self, "_slot_tokens_lock", threading.Lock()):
                             if s_id in self._slot_tokens:
                                 del self._slot_tokens[s_id]
@@ -4551,200 +5480,181 @@ class Engine:
                             st = self.slot_states.get(s_id, {})
                             st["status"] = "idle"
                             self.slot_states[s_id] = st
-                        continue
-                else:
-                    toks, poss, seqs, pmaxs = [], [], [], []
-                    for s_id in active_ids:
-                        req = self._active_slots[s_id]
-                        toks.append(req.next_token)
-                        poss.append(req.pos)
-                        seqs.append(s_id)
-                        pmaxs.append(req.pos)
+                    self._active_slots.clear()
+                    return
 
-                    # Padding to fixed batch size B with slot 0 (dummy rows)
-                    for _ in range(B - n_active):
-                        toks.append(0)
-                        poss.append(0)
-                        seqs.append(0)
-                        pmaxs.append(0)
-
+            # Sample tokens per slot with optional repetition/presence/frequency penalties
+            sampled_tokens = []
+            for idx, s_id in enumerate(active_ids):
+                req = self._active_slots[s_id]
+                slot_logits = logits[idx]
+                if req.out_tokens and (
+                    req.params.repetition_penalty != 1.0
+                    or req.params.presence_penalty != 0.0
+                    or req.params.frequency_penalty != 0.0
+                    or req.params.progressive_penalty > 0.0
+                    or req.params.ban_cycles
+                ):
+                    slot_logits = apply_penalties(
+                        slot_logits,
+                        req.out_tokens,
+                        repetition_penalty=req.params.repetition_penalty,
+                        presence_penalty=req.params.presence_penalty,
+                        frequency_penalty=req.params.frequency_penalty,
+                        window=req.params.penalty_window,
+                        progressive_penalty=req.params.progressive_penalty,
+                        ban_cycles=req.params.ban_cycles,
+                    )
+                try:
+                    if req.params.temperature <= 0:
+                        sampled_tokens.append(int(slot_logits.argmax(dim=-1).item()))
+                    else:
+                        sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
+                except Exception as exc:
+                    print(f"[batched-engine] sampling fallback on slot={s_id}: {exc}", flush=True)
                     try:
-                        logits = self.rt.step(toks, poss, seq=seqs, pmax=pmaxs)
-                    except Exception as exc:
-                        print(f"[batched-engine] decode step error: {exc}", flush=True)
-                        traceback.print_exc()
-                        for s_id in active_ids:
-                            req = self._active_slots[s_id]
-                            req.error = exc
-                            req.done_event.set()
-                            self._free_decode_slots.append(s_id)
-                            with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                                if s_id in self._slot_tokens:
-                                    del self._slot_tokens[s_id]
-                            with self._slot_lock:
-                                st = self.slot_states.get(s_id, {})
-                                st["status"] = "idle"
-                                self.slot_states[s_id] = st
-                        self._active_slots.clear()
-                        continue
-
-                # Sample tokens per slot with optional repetition/presence/frequency penalties
-                sampled_tokens = []
-                for idx, s_id in enumerate(active_ids):
-                    req = self._active_slots[s_id]
-                    slot_logits = logits[idx]
-                    if req.out_tokens and (
-                        req.params.repetition_penalty != 1.0
-                        or req.params.presence_penalty != 0.0
-                        or req.params.frequency_penalty != 0.0
-                        or req.params.progressive_penalty > 0.0
-                        or req.params.ban_cycles
-                    ):
-                        slot_logits = apply_penalties(
-                            slot_logits,
-                            req.out_tokens,
-                            repetition_penalty=req.params.repetition_penalty,
-                            presence_penalty=req.params.presence_penalty,
-                            frequency_penalty=req.params.frequency_penalty,
-                            window=req.params.penalty_window,
-                            progressive_penalty=req.params.progressive_penalty,
-                            ban_cycles=req.params.ban_cycles,
-                        )
-                    try:
-                        if req.params.temperature <= 0:
-                            sampled_tokens.append(int(slot_logits.argmax(dim=-1).item()))
-                        else:
-                            sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
-                    except Exception as exc:
-                        print(f"[batched-engine] sampling fallback on slot={s_id}: {exc}", flush=True)
-                        try:
-                            sampled_tokens.append(int(slot_logits.argmax(dim=-1).item()))
-                        except Exception:
-                            sampled_tokens.append(self.eos)
-
-                finished = []
-                now = time.perf_counter()
-                if self.stats_tracker is not None and n_active > 0:
-                    try:
-                        self.stats_tracker.record_decode_tokens(n_active)
+                        sampled_tokens.append(int(slot_logits.argmax(dim=-1).item()))
                     except Exception:
-                        pass
-                for idx, s_id in enumerate(active_ids):
-                    req = self._active_slots[s_id]
-                    t = sampled_tokens[idx]
-                    req.pos += 1
+                        sampled_tokens.append(self.eos)
 
-                    is_eos = (t == self.eos)
-                    if not is_eos:
-                        req.out_tokens.append(t)
-                        with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                            if s_id in self._slot_tokens:
-                                self._slot_tokens[s_id].append(t)
-                    is_max = (len(req.out_tokens) >= req.max_new)
+            token_batches = [[token] for token in sampled_tokens]
 
-                    # Fast stop condition check: inspect small trailing window to avoid O(N^2) decodes
-                    is_stopped = False
-                    if req.params.stop and not is_eos:
-                        tail_text = self.tok.decode(req.out_tokens[-32:], errors="replace")
-                        for s in req.params.stop:
-                            if s in tail_text:
-                                full_text = self.tok.decode(req.out_tokens, errors="replace")
-                                cut = full_text.find(s)
-                                if cut != -1:
-                                    req.result_text = full_text[:cut]
-                                    req.result_count = len(req.out_tokens)
-                                    is_stopped = True
-                                    break
+        finished = []
+        now = time.perf_counter()
+        emitted_step = 0
+        for idx, s_id in enumerate(active_ids):
+            req = self._active_slots[s_id]
+            for t in token_batches[idx]:
+                req.pos += 1
 
-                    # Degenerate repetition loop detection & auto-truncation
-                    if not is_stopped and not is_eos and getattr(req.params, "loop_detect", True):
-                        min_match = getattr(req.params, "min_loop_match", 48)
-                        min_cycle = getattr(req.params, "min_loop_cycle", 1)
-                        if len(req.out_tokens) >= min_match + min_cycle:
-                            loop_res = detect_loop(req.out_tokens, min_match=min_match, min_cycle=min_cycle)
-                            if loop_res is not None:
-                                cycle_len, trim_count, prev_pos = loop_res
-                                print(
-                                    f"[batched-engine] REPETITION LOOP DETECTED on slot={s_id}: "
-                                    f"cycle={cycle_len} tokens, trimming {trim_count} duplicate tokens (prev_pos={prev_pos}). Stopping.",
-                                    flush=True,
-                                )
-                                if trim_count > 0:
-                                    req.out_tokens = req.out_tokens[:-trim_count]
-                                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                                        if s_id in self._slot_tokens:
-                                            self._slot_tokens[s_id] = self._slot_tokens[s_id][:-trim_count]
-                                req.result_text = self.tok.decode(req.out_tokens, errors="replace")
+                is_eos = (t == self.eos)
+                if not is_eos:
+                    emitted_step += 1
+                    req.out_tokens.append(t)
+                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                        if s_id in self._slot_tokens:
+                            self._slot_tokens[s_id].append(t)
+                is_max = (len(req.out_tokens) >= req.max_new)
+
+                # Fast stop condition check: inspect small trailing window to avoid O(N^2) decodes
+                is_stopped = False
+                if req.params.stop and not is_eos:
+                    tail_text = self.tok.decode(req.out_tokens[-32:], errors="replace")
+                    for s in req.params.stop:
+                        if s in tail_text:
+                            full_text = self.tok.decode(req.out_tokens, errors="replace")
+                            cut = full_text.find(s)
+                            if cut != -1:
+                                req.result_text = full_text[:cut]
                                 req.result_count = len(req.out_tokens)
                                 is_stopped = True
+                                break
 
-                    if is_eos or is_max or is_stopped:
-                        if not is_stopped:
+                # Degenerate repetition loop detection & auto-truncation
+                if not is_stopped and not is_eos and getattr(req.params, "loop_detect", True):
+                    min_match = getattr(req.params, "min_loop_match", 48)
+                    min_cycle = getattr(req.params, "min_loop_cycle", 1)
+                    if len(req.out_tokens) >= min_match + min_cycle:
+                        loop_res = detect_loop(req.out_tokens, min_match=min_match, min_cycle=min_cycle)
+                        if loop_res is not None:
+                            cycle_len, trim_count, prev_pos = loop_res
+                            print(
+                                f"[batched-engine] REPETITION LOOP DETECTED on slot={s_id}: "
+                                f"cycle={cycle_len} tokens, trimming {trim_count} duplicate tokens (prev_pos={prev_pos}). Stopping.",
+                                flush=True,
+                            )
+                            if trim_count > 0:
+                                req.out_tokens = req.out_tokens[:-trim_count]
+                                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                                    if s_id in self._slot_tokens:
+                                        self._slot_tokens[s_id] = self._slot_tokens[s_id][:-trim_count]
                             req.result_text = self.tok.decode(req.out_tokens, errors="replace")
                             req.result_count = len(req.out_tokens)
-                        req.finish_reason = "length" if is_max else "stop"
-                        req.done_event.set()
-                        finished.append(s_id)
-                        dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
-                        tok_s = round(req.result_count / dt_gen, 1)
-                        req.decode_tok_s = tok_s
-                        self.last_decode_tok_s = tok_s
-                        with self._slot_lock:
-                            st = self.slot_states.get(s_id, {})
-                            st["status"] = "completed"
-                            st["generated_tokens"] = req.result_count
-                            st["tok_s"] = tok_s
-                            st["elapsed_s"] = round(now - req.start_time, 2)
-                            st["recent_text"] = req.result_text[-1500:] if len(req.result_text) > 1500 else req.result_text
-                            st["completed_at"] = now
-                            self.slot_states[s_id] = st
-                        print(
-                            f"[batched-engine] finished slot={s_id} tokens={req.result_count} "
-                            f"in {dt_gen:.2f}s ({tok_s} tok/s) "
-                            f"reason={'eos' if is_eos else ('max' if is_max else 'stop')}",
-                            flush=True,
-                        )
-                    else:
-                        req.next_token = t
-                        piece = self.tok.decode([t], errors="replace")
+                            is_stopped = True
+
+                if is_eos or is_max or is_stopped:
+                    if not is_stopped:
+                        req.result_text = self.tok.decode(req.out_tokens, errors="replace")
+                        req.result_count = len(req.out_tokens)
+                    req.finish_reason = "length" if is_max else "stop"
+                    finished.append(s_id)
+                    dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
+                    tok_s = round(max(0, req.result_count - 1) / dt_gen, 1)
+                    req.decode_tok_s = tok_s
+                    self.last_decode_tok_s = tok_s
+                    with self._slot_lock:
+                        st = self.slot_states.get(s_id, {})
+                        st["status"] = "completed"
+                        st["generated_tokens"] = req.result_count
+                        st["tok_s"] = tok_s
+                        st["elapsed_s"] = round(now - req.start_time, 2)
+                        st["recent_text"] = req.result_text[-1500:] if len(req.result_text) > 1500 else req.result_text
+                        st["completed_at"] = now
+                        self.slot_states[s_id] = st
+                    print(
+                        f"[batched-engine] finished slot={s_id} tokens={req.result_count} "
+                        f"in {dt_gen:.2f}s ({tok_s} tok/s) "
+                        f"reason={'eos' if is_eos else ('max' if is_max else 'stop')}",
+                        flush=True,
+                    )
+                else:
+                    req.next_token = t
+                    piece = req.text_decoder.push(t)
+                    if piece:
                         req.live_text += piece
-                        if len(req.live_text) > 2000:
-                            req.live_text = req.live_text[-1500:]
-                        n_tok = len(req.out_tokens)
-                        dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
-                        tok_s = round(n_tok / dt_gen, 1)
-                        with self._slot_lock:
-                            st = self.slot_states.get(s_id, {})
-                            st["status"] = "generating"
-                            st["generated_tokens"] = n_tok
-                            st["tok_s"] = tok_s
-                            st["elapsed_s"] = round(now - req.start_time, 2)
-                            st["recent_text"] = req.live_text
-                            self.slot_states[s_id] = st
+                        if req.stream_queue is not None:
+                            req.stream_queue.put(piece)
+                    if len(req.live_text) > 2000:
+                        req.live_text = req.live_text[-1500:]
+                    n_tok = len(req.out_tokens)
+                    dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
+                    tok_s = round(max(0, n_tok - 1) / dt_gen, 1)
+                    with self._slot_lock:
+                        st = self.slot_states.get(s_id, {})
+                        st["status"] = "generating"
+                        st["generated_tokens"] = n_tok
+                        st["tok_s"] = tok_s
+                        st["elapsed_s"] = round(now - req.start_time, 2)
+                        st["recent_text"] = req.live_text
+                        self.slot_states[s_id] = st
 
-                # Periodic console decode log across active slots in batch (approx every 1s)
-                if now - getattr(self, "_last_decode_log_time", 0.0) >= 1.0:
-                    self._last_decode_log_time = now
-                    parts = []
-                    for sid in active_ids:
-                        if sid not in finished:
-                            r = self._active_slots[sid]
-                            n = len(r.out_tokens)
-                            dt = max(now - (r.first_token_time or r.start_time), 1e-4)
-                            ts = n / dt
-                            tail = (r.live_text[-35:] if len(r.live_text) > 35 else r.live_text).replace("\n", " ").replace("\r", "")
-                            parts.append(f"slot {sid}: {n}/{r.max_new} tok ({ts:.1f} t/s) \"{tail}\"")
-                    if parts:
-                        print(f"[decode] {' | '.join(parts)}", flush=True)
+                if s_id in finished:
+                    break
 
-                for s_id in finished:
-                    del self._active_slots[s_id]
-                    self._free_decode_slots.append(s_id)
+        if self.stats_tracker is not None and emitted_step:
+            self.stats_tracker.record_decode_tokens(emitted_step)
+
+        # Periodic console decode log across active slots in batch (approx every 1s)
+        if now - getattr(self, "_last_decode_log_time", 0.0) >= 1.0:
+            self._last_decode_log_time = now
+            parts = []
+            for sid in active_ids:
+                if sid not in finished:
+                    r = self._active_slots[sid]
+                    n = len(r.out_tokens)
+                    dt = max(now - (r.first_token_time or r.start_time), 1e-4)
+                    ts = n / dt
+                    tail = (r.live_text[-35:] if len(r.live_text) > 35 else r.live_text).replace("\n", " ").replace("\r", "")
+                    parts.append(f"slot {sid}: {n}/{r.max_new} tok ({ts:.1f} t/s) \"{tail}\"")
+            if parts:
+                print(f"[decode] {' | '.join(parts)}", flush=True)
+
+        for s_id in finished:
+            completed = self._active_slots.pop(s_id)
+            self._free_decode_slots.append(s_id)
+            completed.done_event.set()
+        if not self._active_slots:
+            self.current_phase = "idle"
+        if self.mtp and not self._active_slots:
+            with self._slot_lock:
+                self.mtp_stats["status"] = "completed"
 
     @torch.inference_mode()
-    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> tuple[str, int]:
+    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, cancel_event=None) -> tuple[str, int]:
         _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
+        if max_new <= 0:
+            raise ValueError("no token budget remains for generation")
         if len(prompt_ids) > _mtp_long_limit:
             _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536")))
             max_new = min(max_new, _long_cap)
@@ -4754,6 +5664,10 @@ class Engine:
             gen.manual_seed(p.seed)
 
         req = _BatchRequest(prompt_ids, p, max_new, gen, images=images, token_types=token_types)
+        if cancel_event is not None:
+            req.cancel_event = cancel_event
+        req.disable_prefix_cache = self._disable_prefix_cache_once
+        self._disable_prefix_cache_once = False
         self._batch_queue.put(req)
         req.done_event.wait()
         if req.error:
@@ -4761,6 +5675,56 @@ class Engine:
         self.last_decode_tok_s = getattr(req, "decode_tok_s", None)
         self.last_finish_reason = getattr(req, "finish_reason", "stop")
         return req.result_text, req.result_count
+
+
+    def stream_text(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, cancel_event=None):
+        """Yield (piece, None) during decode and (final_text, token_count) at completion."""
+        if self.max_seqs <= 1:
+            pieces = []
+            for _, piece in self.generate(prompt_ids, p, images=images, token_types=token_types):
+                pieces.append(piece)
+                if piece:
+                    yield piece, None
+            with self._slot_lock:
+                n = self.slot_states[0]["generated_tokens"]
+            yield "".join(pieces), n
+            return
+
+        max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
+        if max_new <= 0:
+            raise ValueError("no token budget remains for generation")
+        long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
+        if len(prompt_ids) > long_limit:
+            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536"))))
+        gen = None
+        if p.seed is not None:
+            gen = torch.Generator(device=self.model.blocks[-1].device)
+            gen.manual_seed(p.seed)
+        req = _BatchRequest(prompt_ids, p, max_new, gen, images=images, token_types=token_types)
+        if cancel_event is not None:
+            req.cancel_event = cancel_event
+        req.stream_queue = queue.Queue()
+        req.disable_prefix_cache = self._disable_prefix_cache_once
+        self._disable_prefix_cache_once = False
+        self._batch_queue.put(req)
+        try:
+            while not req.done_event.is_set() or not req.stream_queue.empty():
+                try:
+                    piece = req.stream_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if piece:
+                    yield piece, None
+        finally:
+            # Cancellation is acknowledged before maintenance may touch model state.
+            if not req.done_event.is_set():
+                req.cancel_event.set()
+            req.done_event.wait()
+        if req.error:
+            raise req.error
+        self.last_decode_tok_s = req.decode_tok_s
+        self.last_finish_reason = req.finish_reason
+        yield req.result_text, req.result_count
 
 
 def parse_budgets(spec: str) -> dict[int, float] | None:

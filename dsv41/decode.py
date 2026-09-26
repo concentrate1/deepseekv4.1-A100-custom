@@ -6,6 +6,7 @@ the window ring index pattern, the compressor's parity, the compressed-KV / inde
 future positions masked. Host work per step is reduced to: the Engram table gather (CPU), a few tiny
 H2D/D2D copies between GPU segments, and one graph launch per GPU."""
 from __future__ import annotations
+from contextlib import contextmanager
 
 import os
 import sys
@@ -25,7 +26,29 @@ FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"
 _CPU_DEBUG = os.environ.get("DSV41_CPU_DEBUG") is not None
 FP4_TC = os.environ.get("DSV41_FP4_TC", "1") == "1"  # expert GEMM on tensor cores (cuda/fp4_tc.cu) instead of the GEMV
 HC_FORK = os.environ.get("DSV41_HC_FORK", "1") == "1"  # hyper-connection mixes + sinkhorn on a side stream (a parallel graph branch)
+INDEXER_SHARED = os.environ.get("DSV41_INDEXER_SHARED", "0") == "1"  # opt-in single-sequence indexer A/B
 _LOGGED_SLOT = False
+
+
+def _indexer_score(q: torch.Tensor, index_k: torch.Tensor, seq: torch.Tensor,
+                   single_sequence: bool, gather_rows: bool, shared_sequence_rows: bool = False, sequence_group_size: int = 0) -> torch.Tensor:
+    """Score index keys; avoid copying the one deployed sequence across verifier rows."""
+    qf = q.float()
+    if single_sequence:
+        return torch.einsum("bshd,td->bsht", qf, index_k[0].float())
+    if shared_sequence_rows:
+        # A single-request verifier can occupy any sequence slot. Gather that
+        # slot once, instead of copying its full index cache once per MTP row.
+        selected = index_k.index_select(0, seq[:1])[0]
+        return torch.einsum("bshd,td->bsht", qf, selected.float())
+    if sequence_group_size:
+        k = sequence_group_size
+        batch, length, heads, dim = qf.shape
+        grouped = qf.reshape(batch // k, k, length, heads, dim)
+        selected = index_k.index_select(0, seq[::k]).float()
+        return torch.einsum("gkshd,gtd->gksht", grouped, selected).reshape(batch, length, heads, -1)
+    selected = index_k.index_select(0, seq) if gather_rows else index_k
+    return torch.einsum("bshd,btd->bsht", qf, selected.float())
 
 
 class DecodeRuntime:
@@ -90,12 +113,15 @@ class DecodeRuntime:
     def attention2(self, A: Attention, x: torch.Tensor, xq: torch.Tensor, d: torch.device) -> torch.Tensor:
         """x: rmsnorm output bf16 [B, dim] (unquantized, for the compressor/indexer); xq: its fp8 fake-quantized copy."""
         B = x.shape[0]
+        trace = getattr(self, "trace", None) is not None
         pos, seq, pmax = self.pos[d], self.seq[d], self.pmax[d]
         rd, eps = self.rd, A.eps
         qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
         q = linear_w(qr, A.wq_b).view(B, 1, A.n_heads, A.head_dim)
         rope_dev_(q, rd, A.cos, A.sin, pos)
         kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps, seq)
+        if trace:
+            self._stamp(d, A.layer_id, 16)
         if A.ratio:
             ratio = A.ratio
             compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")  # [B]
@@ -106,8 +132,14 @@ class DecodeRuntime:
                 latent, should = self.compressor2(A, x3, pos, seq)
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
                 row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))  # [B]
+            if trace:
+                self._stamp(d, A.layer_id, 17)
             if A.is_index_source:
+                if trace:
+                    self._stamp(d, A.layer_id, 14)
                 idxs = self.indexer(A, x3, qr.view(B, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
+                if trace:
+                    self._stamp(d, A.layer_id, 15)
                 self.topk_buf[d].copy_(idxs)
             else:
                 idxs = self.topk_buf[d]
@@ -120,11 +152,21 @@ class DecodeRuntime:
                 val.copy_(latent)
                 idx.copy_(row)
             ckv = self.m.shared.compress_kv[(self.kv_owner, d)]
+            if trace:
+                self._stamp(d, A.layer_id, 18)
             o = sattn2(q, A.window_kv_cache, ckv, idxs, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale, seq, pmax)
         else:
+            if trace:
+                self._stamp(d, A.layer_id, 17)
+                self._stamp(d, A.layer_id, 18)
             o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale, seq, pmax)
+        if trace:
+            self._stamp(d, A.layer_id, 19)
         o = oproj_a(o.view(B, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
-        return linear_fp8(o, A.wo_b)
+        out = linear_fp8(o, A.wo_b)
+        if trace:
+            self._stamp(d, A.layer_id, 20)
+        return out
 
     def attention(self, A: Attention, x: torch.Tensor, d: torch.device) -> torch.Tensor:
         pos = self.pos[d]
@@ -229,10 +271,10 @@ class DecodeRuntime:
         rope_dev_(q, rd, I.cos, I.sin, pos)
         q = fake_quant_fp4(q, 32)
         index_k = self.m.shared.index_k[(self.index_owner, d)]  # [S, max_c + 1, 128] (last row = dummy)
-        if FUSED2:
-            index_k = index_k.index_select(0, self.seq[d])  # the row's sequence
         weights = F.linear(x, I.weights_proj) * (I.softmax_scale * I.n_heads**-0.5)
-        score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
+        score = _indexer_score(q, index_k, self.seq[d], self.S == 1 and INDEXER_SHARED, FUSED2,
+                               getattr(self, "shared_sequence_rows", False),
+                               getattr(self, "sequence_group_size", 0))
         score = (score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)  # [B, 1, max_c + 1]
         n_pos = score.shape[-1]
         cl = compress_len.view(-1, 1, 1) if compress_len.dim() else compress_len
@@ -533,6 +575,39 @@ class DecodeRuntime:
                      for name in ("compress_kv", "index_k")
                      for key, value in getattr(self.m.shared, name).items())
 
+    @contextmanager
+    def _capture_in_scratch_slot(self):
+        """Warm/capture at small scratch positions and restore persistent state even on failure."""
+        inputs = [(self.tok, self.tok.clone())]
+        for table in (self.pos, self.seq, self.pmax):
+            inputs.extend((tensor, tensor.clone()) for tensor in table.values())
+        small = []
+        for block in self.m.blocks:
+            attention = block.attn
+            window = attention.window_kv_cache
+            small.append((window[:1], window[:1].clone()))
+            compressor = attention.compressor
+            if compressor is not None:
+                for name in ("kv_state", "score_state", "kv_ring", "score_ring"):
+                    tensor = getattr(compressor, name, None)
+                    if torch.is_tensor(tensor):
+                        small.append((tensor[:1], tensor[:1].clone()))
+        for name in ("compress_kv", "index_k"):
+            for tensor in getattr(self.m.shared, name).values():
+                # Small positions can write only these prefix rows or the dummy last row.
+                small.append((tensor[:1, :self.B], tensor[:1, :self.B].clone()))
+                small.append((tensor[:1, -1:], tensor[:1, -1:].clone()))
+        try:
+            self.tok.zero_()
+            for device in self.devices:
+                self.pos[device].copy_(torch.arange(self.B, device=device))
+                self.seq[device].zero_()
+                self.pmax[device].fill_(self.B - 1)
+            yield
+        finally:
+            for target, saved in small + inputs:
+                target.copy_(saved)
+
     def _prepare_decode_cache(self, end_pos):
         """Grow before GPU dispatch; tensor .item() is illegal during capture.
 
@@ -560,15 +635,9 @@ class DecodeRuntime:
                 torch.cuda.synchronize(device)
             try:
                 print(f"[decode-cache] cache storage changed; recapturing CUDA graphs for {self.__class__.__name__} (B={self.B})...", flush=True)
-                # Preserve row 0 across all slots so warm-up writes do not clobber existing prompt/decode KV state
-                _ckv_backup = {k: v[:, :1].clone() for k, v in shared.compress_kv.items()}
-                _idx_backup = {k: v[:, :1].clone() for k, v in shared.index_k.items()}
-                self.capture()
-                with torch.inference_mode():
-                    for k, v in _ckv_backup.items():
-                        shared.compress_kv[k][:, :1].copy_(v)
-                    for k, v in _idx_backup.items():
-                        shared.index_k[k][:, :1].copy_(v)
+                with self._capture_in_scratch_slot():
+                    self.graphs.clear()
+                    self.capture()
                 for device in self.devices:
                     torch.cuda.synchronize(device)
                 self._graph_cache_signature = self._cache_signature()

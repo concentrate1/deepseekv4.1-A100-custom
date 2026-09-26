@@ -243,7 +243,7 @@ def choose_hot_experts(stats_path: str, per_layer: int, n_layers: int) -> dict[i
 def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max_batch: int = 1, max_seqs: int | None = None,
                budgets_gb: dict[int, float] | None = None, n_layers: int | None = None, engram: bool = True,
                tokenizer=None, offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False,
-               ep_shards: list[int] | None = None) -> Transformer:
+               ep_shards: list[int] | None = None, ep_devices: list[int] | None = None) -> Transformer:
     """ep: expert parallelism over `devices` (dense layers pipelined over them in order, every layer's experts
     sharded across all of them; see dsv41/ep.py). ep_shards: experts per device (default: equal split)."""
     global HOT_EXPERTS
@@ -279,12 +279,13 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
         else:
             placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]
         E = cfg["n_routed_experts"]
-        if ep_shards:
-            assert len(ep_shards) == nd and sum(ep_shards) == E, (ep_shards, E)
-            bounds = [sum(ep_shards[:j]) for j in range(nd + 1)]
-        else:
-            bounds = [E * j // nd for j in range(nd + 1)]
-        ep_shards = [(torch.device(f"cuda:{devices[j]}"), bounds[j], bounds[j + 1] - bounds[j]) for j in range(nd)]
+        from .expert_layout import expert_shard_layout
+        ep_shards = [(torch.device(f"cuda:{dev}"), start, count)
+                     for dev, start, count in expert_shard_layout(devices, ep_devices, ep_shards, E)]
+        for src, _, _ in ep_shards:
+            for dst, _, _ in ep_shards:
+                if src != dst and not torch.cuda.can_device_access_peer(src, dst):
+                    raise RuntimeError(f"expert parallelism requires direct P2P: {src} -> {dst} unavailable")
         print("expert shards:", {str(d): n for d, _, n in ep_shards}, flush=True)
     else:
         placement = plan_placement(n_layers, devices, budgets_gb, offload=offload_experts)

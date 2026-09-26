@@ -1,0 +1,40 @@
+# Development shell: enter the container, then install dependencies and start the service.
+services:
+  deepseek:
+    image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
+    container_name: deepseek-v41
+
+    # Host networking and IPC match the deployment recipe.
+    # privileged: true       # Broad access to host devices; GPU reservation below is sufficient normally.
+    ipc: host                # Required by this deployment; shares host IPC and /dev/shm.
+    network_mode: host       # Launcher binds host.docker.internal; no port mapping is needed.
+
+    extra_hosts:
+      - "host.docker.internal=host-gateway"
+
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+
+    volumes:
+      # Models are read-only. Default workspace is this repository, not a new empty directory.
+      - "${DSV41_MODELS_DIR:-/var/models}:/models:ro"
+      - "${DSV41_WORKSPACE_DIR:-.}:/workspace"
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      DSV41_NVCC: /usr/local/cuda/bin/nvcc
+      DSV41_CKPT: /models/DeepSeek-V4.1-Flash
+      PYTHONUNBUFFERED: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    command: /bin/bash

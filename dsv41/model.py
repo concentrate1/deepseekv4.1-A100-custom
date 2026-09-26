@@ -2328,12 +2328,23 @@ class Transformer:
         self._stages_cache = stages
         return stages
 
+    def _prefill_layer_boundary(self, block):
+        callback = getattr(self, "_prefill_yield_decode", None)
+        if (callback is not None and (block.layer_id + 1) % 4 == 0
+                and block is not self.blocks[-1]):
+            if callback(min_interval_s=0.25):
+                self._prefill_forward_yielded = True
+
     @torch.inference_mode()
     def _forward_sequential(self, input_ids: torch.Tensor, start_pos: int = 0, images=None, token_types: torch.Tensor | None = None) -> torch.Tensor:
         """input_ids [b, s] (long) -> logits for the last position [b, vocab] (fp32)."""
         dev0 = self.blocks[0].device
         input_ids = input_ids.to(dev0)
         B, S = input_ids.shape
+        self._prefill_forward_yielded = False
+        prepare_decode = getattr(self, "_prefill_prepare_decode", None)
+        if prepare_decode is not None:
+            prepare_decode(end_pos=start_pos + S)
         image_mask = None if token_types is None else (token_types >= 0).to(dev0)
         engram_mask = None if image_mask is None else ~image_mask
         hashes = self.engram_hash(input_ids, start_pos, token_mask=engram_mask) if self.engram_hash is not None else None
@@ -2367,12 +2378,14 @@ class Transformer:
                     pre_mix = pre_mix.to(blk.device, non_blocking=True)
                 t = _tick("transfer", t)
                 if blk.engram is not None and hashes is not None:
-                    h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
+                    mask = None if engram_mask is None else engram_mask.to(blk.device)
+                    h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :], mask)
                     _tick("engram", t)
                 if blk.layer_id in targets:
                     main_hiddens.append(h.mean(dim=2))
                 im = None if image_mask is None else image_mask.to(blk.device)
                 h, pre_mix = blk(h, start_pos, pre_mix, image_mask=im)
+                self._prefill_layer_boundary(blk)
 
             # Stage 2: Decoder pass (layers enc_last_id + 1 .. 39) on ONLY bounded tail window.
             tail_len = min(S, max(win_size, int(os.environ.get("DSV41_CED_TAIL_WINDOW", str(win_size)))))
@@ -2389,12 +2402,14 @@ class Transformer:
                 t = _tick("transfer", t)
                 if blk.engram is not None and hashes is not None:
                     chunk_hashes = hashes[:, -tail_len:, blk.engram.layer_hash_index, :]
-                    h_dec = blk.engram(h_dec, chunk_hashes)
+                    mask = None if engram_mask is None else engram_mask[:, -tail_len:].to(blk.device)
+                    h_dec = blk.engram(h_dec, chunk_hashes, mask)
                     _tick("engram", t)
                 if blk.layer_id in targets:
                     main_hiddens.append(h_dec.mean(dim=2))
                 im_dec = None if image_mask is None else image_mask[:, -tail_len:].to(blk.device)
                 h_dec, pre_mix_dec = blk(h_dec, start_pos_dec, pre_mix_dec, image_mask=im_dec)
+                self._prefill_layer_boundary(blk)
 
             if main_hiddens:
                 keep = int(self.args.cfg.get("window_size", 0))
@@ -2413,12 +2428,14 @@ class Transformer:
                 pre_mix = pre_mix.to(blk.device, non_blocking=True)
             t = _tick("transfer", t)
             if blk.engram is not None and hashes is not None:
-                h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
+                mask = None if engram_mask is None else engram_mask.to(blk.device)
+                h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :], mask)
                 _tick("engram", t)
             if blk.layer_id in targets:  # DSpark reads the attention input of its target layers
                 main_hiddens.append(h.mean(dim=2))
             im = None if image_mask is None else image_mask.to(blk.device)
             h, pre_mix = blk(h, start_pos, pre_mix, image_mask=im)
+            self._prefill_layer_boundary(blk)
         if main_hiddens:
             # MTP/DSpark only consumes the recent main attention window.
             keep = int(self.args.cfg.get("window_size", 0))
@@ -2447,6 +2464,7 @@ class Transformer:
         Encoder layers (0 .. 20). Decoder layers (21 .. 39) are executed exclusively
         for the final chunk, reducing long-context prefill compute by nearly 50%.
         """
+        self._prefill_forward_yielded = False
         stages = self._get_stages()
         K = len(stages)
         dev0 = stages[0]["device"]
@@ -2476,18 +2494,30 @@ class Transformer:
                 pos += chunk_size
         M = len(chunk_bounds)
 
-        # Pre-ensure capacity for all KV and index owners upfront so no reallocations happen mid-pipeline
+        # Pre-ensure capacity for all KV and index owners upfront so no reallocations happen mid-pipeline.
+        grew_cache = False
         for owner in self.shared.cache_max_rows:
             ratio = int(self.args.compress_ratios[owner])
             needed = (start_pos + S + ratio - 1) // ratio
-            self.shared._ensure_capacity(self.shared.compress_kv, owner, needed, "compress_kv")
-            self.shared._ensure_capacity(self.shared.index_k, owner, needed, "index_k")
+            for table, kind in ((self.shared.compress_kv, "compress_kv"),
+                                (self.shared.index_k, "index_k")):
+                key = next(key for key in table if key[0] == owner)
+                before_rows = table[key].size(1)
+                self.shared._ensure_capacity(table, owner, needed, kind)
+                grew_cache |= table[key].size(1) != before_rows
 
-        # Free stale reserved allocator blocks after capacity expansion
-        for dev in getattr(self, "devices", []):
-            if isinstance(dev, (int, torch.device)) or (isinstance(dev, str) and "cuda" in str(dev)):
-                with torch.cuda.device(dev):
-                    torch.cuda.empty_cache()
+        # Reclaim old allocator blocks only after a cache reallocation.
+        if grew_cache:
+            for dev in getattr(self, "devices", []):
+                if isinstance(dev, (int, torch.device)) or (isinstance(dev, str) and "cuda" in str(dev)):
+                    with torch.cuda.device(dev):
+                        torch.cuda.empty_cache()
+
+        # Prepare the old request's decode graph before allocating pipeline
+        # activations; a growth-triggered recapture can need temporary memory.
+        prepare_decode = getattr(self, "_prefill_prepare_decode", None)
+        if prepare_decode is not None:
+            prepare_decode()
 
         # Chunk-level engram hashes computed on demand to avoid allocating hundreds of MBs on GPU 0
         chunk_hashes_map: dict[int, torch.Tensor] = {}
@@ -2504,6 +2534,27 @@ class Transformer:
 
         T = M + K - 1
         final_logits = None
+        # Completion events from the last active stage of each chunk are
+        # queried by the metrics thread without synchronizing the GPU.
+        self._prefill_progress = {
+            "total_tokens": S,
+            "start_pos": start_pos,
+            "total_chunks": M,
+            "started_at": time.perf_counter(),
+            "events": [],
+        }
+
+        # Image positions are absolute in the full prompt. Pre-encode each span
+        # once and scatter its overlapping slices into every pipeline chunk.
+        image_spans = []
+        if images is not None and start_pos == 0:
+            if self.vision_tower is None:
+                raise ValueError("image input requires loaded vision weights")
+            for sample_id, sample in enumerate(images):
+                for img in sample or ():
+                    encoded = self.vision_tower.image_span_embeddings(img, dev0, self.embed.dtype)
+                    image_spans.append((sample_id, img.start, encoded))
+            from .vision import scatter_image_spans
 
         ev_start = torch.cuda.Event()
         ev_start.record(torch.cuda.current_stream(dev0))
@@ -2552,8 +2603,8 @@ class Transformer:
                     if k == 0:
                         chunk_ids = input_ids[:, c0:c1].to(dev_k, non_blocking=True)
                         h = F.embedding(chunk_ids, self.embed)
-                        if images is not None and m == 0 and start_pos == 0 and getattr(self, "vision_tower", None) is not None:
-                            self.vision_tower.merge_image_embeddings(images, h)
+                        if image_spans:
+                            scatter_image_spans(h, image_spans, c0)
                         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
                         pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
                         pre_mix[:, :, 0] = 1.0
@@ -2580,7 +2631,8 @@ class Transformer:
                             blk_hash = chunk_hashes[:, :, blk.engram.layer_hash_index, :]
                             if blk_hash.device != dev_k:
                                 blk_hash = blk_hash.to(dev_k, non_blocking=True)
-                            h = blk.engram(h, blk_hash)
+                            mask = None if image_mask is None else (~image_mask[:, c0:c1]).to(dev_k)
+                            h = blk.engram(h, blk_hash, mask)
                         if blk.layer_id in targets:
                             chunk_main_hiddens[blk.layer_id].append(h.mean(dim=2))
                         chunk_im = None
@@ -2602,6 +2654,8 @@ class Transformer:
                         self.shared.cleanup_chunk(m)
 
                     ev_stage_done[k][m].record(stream_k)
+                    if not next_stage_has_blocks:
+                        self._prefill_progress["events"].append((c1, ev_stage_done[k][m]))
 
                     # Periodic progress logging for long contexts
                     if progress_interval > 0 and k == K - 1 and ((m + 1) % progress_interval == 0 or m == M - 1):
@@ -2627,6 +2681,14 @@ class Transformer:
                             f"VRAM used: [{mem_info}] GiB",
                             flush=True,
                         )
+
+            # Every stage submission in this wave is complete before the
+            # engine advances an existing decode slot. CED, image positions,
+            # chunk activations and this pipeline plan remain unchanged.
+            yield_decode = getattr(self, "_prefill_yield_decode", None)
+            if yield_decode is not None and t < T - 1:
+                if yield_decode():
+                    self._prefill_forward_yielded = True
 
         torch.cuda.current_stream(last_dev).wait_stream(self._stage_streams[-1])
         self.shared._current_chunk_idx = 0

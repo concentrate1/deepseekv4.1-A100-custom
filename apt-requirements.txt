@@ -1,0 +1,7 @@
+# Direct Ubuntu 24.04 packages needed by this project. CUDA 12.8 and the
+# NVIDIA driver are host-level prerequisites and are intentionally omitted.
+build-essential
+git
+python3.12
+python3-pip
+wget
