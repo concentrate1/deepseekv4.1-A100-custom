@@ -629,9 +629,11 @@ class Engine:
 
     def jev_inference(self, prompt: str, schema: dict, max_batch: int = 32) -> tuple[dict, dict]:
         with self.lock:
+            previous_phase = self.current_phase
             self.current_phase = "jev"
             try:
-                assembled, metrics = self.jev_engine.process_request(prompt, schema, max_batch=max_batch)
+                # Rows above zero may belong to paused batch requests.
+                assembled, metrics = self.jev_engine.process_request(prompt, schema, max_batch=1)
                 tot_tokens = metrics.get("prompt_tokens", 0)
                 reused = metrics.get("prefix_saved_tokens", 0)
                 new_tok = max(0, tot_tokens - reused)
@@ -645,7 +647,12 @@ class Engine:
                     )
                 return assembled, metrics
             finally:
-                self.current_phase = "idle"
+                self._invalidate_live_slot(0)
+                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                    getattr(self, "_slot_tokens", {}).pop(0, None)
+                self._prefix_prompt_ids = None
+                self._prefix_len = 0
+                self.current_phase = previous_phase
 
     @staticmethod
     def _completed_prefill_work(state: dict | None) -> dict | None:
@@ -792,6 +799,7 @@ class Engine:
             "combined_decode_tok_s": round(combined_tok_s, 1),
             "decode_10s_tok_s": getattr(getattr(self, "stats_tracker", None), "decode_tok_s_10s", None),
             "mtp": mtp_stats,
+            "prefill_interleave": dict(getattr(self, "prefill_interleave_stats", {})),
             "phase_profile": getattr(self, "last_phase_profile", None),
             "prefill_work": self._live_prefill_work()
                 if any(st.get("status") == "prefilling" for st in slots_list) else None,
@@ -1456,6 +1464,7 @@ class Engine:
     @torch.inference_mode()
     def _restore_prefix_state(self, snap):
         """Restore a previously captured attention-cache snapshot."""
+        self._invalidate_live_slot(0)
         touched = set()
         # Validate the entire snapshot before touching any live state. Legacy
         # multi-slot payloads must not be restored over current decode slots.
@@ -3387,9 +3396,29 @@ class Engine:
 
         return len(entries), total
 
+    def _invalidate_live_slot(self, slot):
+        self.__dict__.setdefault("_slot_cache_ends", {}).pop(slot, None)
+
+    def _mark_live_slot(self, slot, end):
+        if not getattr(self, "mtp", 0):
+            self.__dict__.setdefault("_slot_cache_ends", {})[slot] = int(end)
+
+    def _gpu_slot_reuse_pos(self, slot, lcp, total):
+        # 默认关闭这条直接续算路径；关闭仍可使用快照缓存，MTP 不使用此路径。
+        # Never rewind a mutable ring or compressor. MTP can leave rejected
+        # future rows, so only ordinary decode publishes committed boundaries.
+        if (os.environ.get("DSV41_LIVE_SLOT_REUSE", "0") != "1"
+                or getattr(self, "mtp", 0)):
+            return None
+        end = getattr(self, "_slot_cache_ends", {}).get(slot)
+        if end is None or end <= 0 or end % 16 or not end < total or lcp < end:
+            return None
+        return end
+
     def _find_best_gpu_slot(self, prompt_ids: list[int]) -> tuple[int, int]:
-        """Find the GPU sequence slot with the longest common prefix against prompt_ids.
-        Returns (best_slot, best_lcp_length). If no slot matches, returns (-1, 0)."""
+        """Find the deepest committed boundary that can continue without rewinding."""
+        if os.environ.get("DSV41_LIVE_SLOT_REUSE", "0") != "1" or getattr(self, "mtp", 0):
+            return -1, 0
         best_slot = -1
         best_lcp = 0
         with getattr(self, "_slot_tokens_lock", threading.Lock()):
@@ -3398,10 +3427,14 @@ class Engine:
         for slot_id, tokens in items:
             if not tokens:
                 continue
-            lcp = self._prompt_lcp(tokens, prompt_ids)
+            reuse_pos = self._gpu_slot_reuse_pos(slot_id, len(tokens), len(prompt_ids))
+            if reuse_pos is None:
+                continue
+            if self._prompt_lcp(tokens, prompt_ids) < reuse_pos:
+                continue
             # Prefer slot 0 on tie because slot 0 is already the prefill scratchpad
-            if lcp > best_lcp or (lcp == best_lcp and slot_id == 0 and best_slot != 0):
-                best_lcp = lcp
+            if reuse_pos > best_lcp or (reuse_pos == best_lcp and slot_id == 0 and best_slot != 0):
+                best_lcp = reuse_pos
                 best_slot = slot_id
         return best_slot, best_lcp
 
@@ -3466,6 +3499,11 @@ class Engine:
         t0 = time.perf_counter()
         total = len(prompt_ids)
 
+        reuse_pos = self._gpu_slot_reuse_pos(best_slot, best_lcp, total)
+        if reuse_pos is None:
+            raise ValueError("live slot reuse requires an exact committed continuation boundary")
+        self._invalidate_live_slot(0)
+
         # 1. If best_slot is not slot 0, copy its per-sequence state to slot 0 on GPU
         if best_slot != 0:
             self.rt.copy_seq(best_slot, 0, req_id=req_id)
@@ -3477,13 +3515,6 @@ class Engine:
                             torch.cuda.synchronize(d)
                         except Exception:
                             pass
-
-        # 2. Align reuse_pos to compression ratio boundary (multiple of 16).
-        # If best_lcp matches the entire prompt, keep at least 1-16 tokens to compute logits.
-        if best_lcp >= total:
-            reuse_pos = max(0, total - 16)
-        else:
-            reuse_pos = (best_lcp // 16) * 16
 
         suffix_len = total - reuse_pos
         self._set_prefill_route(total, reuse_pos, "gpu_hit")
@@ -3638,12 +3669,14 @@ class Engine:
         self._prefix_replay_progress = None
         self._prefill_route = None
         self._set_prefill_route(len(prompt_ids), 0, "cold_vision" if images is not None else "cold")
+        # 仅排查时设为 1：绕过全部前缀复用，每次重算输入，长输入可能明显变慢。
         _disable_prefix_cache = (
             os.environ.get("DSV41_DISABLE_PREFIX_CACHE", "0") == "1"
             or bool(getattr(self, "_disable_prefix_cache_once", False))
         )
         self._disable_prefix_cache_once = False
         if images is not None:
+            self._invalidate_live_slot(0)
             self._prefix_prompt_ids = None
             self._prefix_len = 0
             with self._slot_tokens_lock:
@@ -3653,6 +3686,7 @@ class Engine:
             )
 
         if _disable_prefix_cache:
+            self._invalidate_live_slot(0)
             _t0 = time.perf_counter()
 
             logits = self.model.forward(
@@ -3713,12 +3747,7 @@ class Engine:
         # prefix of prompt_ids in VRAM, avoid all host RAM restore, PCIe
         # traffic, and slow rollback.
         # ------------------------------------------------------------
-        use_gpu_cache = (
-            os.environ.get("DSV41_GPU_PREFIX_CACHE", "1") != "0"
-            # Batched speculation leaves unaccepted rows in live slot rings.
-            # Live slots are unsafe; batch MTP uses immutable GPU/host anchors below.
-            and not (getattr(self, "max_seqs", 1) > 1 and getattr(self, "mtp", 0))
-        )
+        use_gpu_cache = os.environ.get("DSV41_LIVE_SLOT_REUSE", "0") == "1" and not getattr(self, "mtp", 0)
         min_gpu_prefix = int(
             os.environ.get("DSV41_GPU_PREFIX_MIN", "64")
         )
@@ -3743,6 +3772,7 @@ class Engine:
                 self._prefix_replay_progress = None
                 self.model._prefill_progress = None
 
+        self._invalidate_live_slot(0)
         # Search ALL retained host-RAM snapshots.
         entry = self._find_prefix_cache_entry(
             prompt_ids
@@ -4315,6 +4345,8 @@ class Engine:
                 )
                 with getattr(self, "_slot_tokens_lock", threading.Lock()):
                     self._slot_tokens[0] = [-1] if images is not None else list(prompt_ids)
+                if images is None:
+                    self._mark_live_slot(0, len(prompt_ids))
                 self.current_phase = "decode"
                 pos = len(prompt_ids)
                 out: list[int] = []
@@ -4421,7 +4453,10 @@ class Engine:
                                             self._slot_tokens[0] = self._slot_tokens[0][:-trim_count]
                                 return
                     target_t0 = time.perf_counter() if phase is not None else None
+                    self._invalidate_live_slot(0)
                     logits = self.rt.step(t, pos)
+                    if images is None:
+                        self._mark_live_slot(0, pos + 1)
                     if phase is not None:
                         phase["target_ms"] += (time.perf_counter() - target_t0) * 1000
                         phase["steps"] += 1
@@ -5006,10 +5041,10 @@ class Engine:
         )
 
     def _prefill_decode_runtime(self):
-        """The two-slot profile has at most one active request while the other prefills."""
+        """Use a single-request graph so prefill slot 0 never receives padding writes."""
         active = getattr(self, "_active_slots", {})
         if (os.environ.get("DSV41_COOPERATIVE_PREFILL", "1") != "1"
-                or len(active) != 1 or getattr(self, "_cooperating_prefill", False)):
+                or not active or getattr(self, "_cooperating_prefill", False)):
             return None
         if self.mtp:
             return getattr(self, "rt_mtp_single", None)
@@ -5028,9 +5063,9 @@ class Engine:
         rt = self._prefill_decode_runtime()
         if rt is None:
             return
-        req = next(iter(self._active_slots.values()))
         self._sync_prefill_devices()
-        rt._prepare_decode_cache(max(req.pos + rt.B, end_pos or 0))
+        decode_end = max(req.pos + rt.B for req in self._active_slots.values())
+        rt._prepare_decode_cache(max(decode_end, end_pos or 0))
         self._prefill_last_decode_yield = time.perf_counter()
 
     def _yield_prefill_decode(self, min_interval_s=None):
@@ -5038,7 +5073,6 @@ class Engine:
         rt = self._prefill_decode_runtime()
         if rt is None:
             return
-        req = next(iter(self._active_slots.values()))
         # Do not allocate/recapture a graph while pipeline activations are live.
         # Normal decode will handle any further growth once prefill completes.
         if rt._cache_signature() != getattr(rt, "_graph_cache_signature", None):
@@ -5048,12 +5082,13 @@ class Engine:
         saved = {name: getattr(shared, name) for name in
                  ("_current_chunk_idx", "kv_owner", "index_owner") if hasattr(shared, name)}
         phase = self.current_phase
-        before = len(req.out_tokens)
-        self._sync_prefill_devices()
         now = time.perf_counter()
         elapsed = max(0.0, now - getattr(self, "_prefill_last_decode_yield", now))
         if min_interval_s is not None and elapsed < min_interval_s:
             return False
+        self._sync_prefill_devices()
+        requests = list(self._active_slots.values())
+        before = sum(len(req.out_tokens) for req in requests)
         steps_before = self.prefill_interleave_stats["decode_steps"]
         self._cooperating_prefill = True
         try:
@@ -5063,17 +5098,22 @@ class Engine:
             deadline = time.perf_counter() + budget
             self.prefill_interleave_stats["slices"] += 1
             while self._active_slots and time.perf_counter() < deadline:
-                req = next(iter(self._active_slots.values()))
+                eligible = [sid for sid, req in self._active_slots.items()
+                            if not self.mtp or req.pos + self.ds.block < self.max_seq_len]
+                if not eligible:
+                    break
+                eligible.sort()
+                last = getattr(self, "_prefill_last_slot", -1)
+                sid = next((sid for sid in eligible if sid > last), eligible[0])
+                req = self._active_slots[sid]
                 end_pos = req.pos + rt.B
-                if any(table[key].shape[1] < end_pos // self.model.blocks[key[0]].attn.ratio + 1
-                       for table in (shared.compress_kv, shared.index_k) for key in table):
+                if (rt._cache_signature() != getattr(rt, "_graph_cache_signature", None)
+                        or any(table[key].shape[1] < end_pos // self.model.blocks[key[0]].attn.ratio + 1
+                               for table in (shared.compress_kv, shared.index_k) for key in table)):
                     self.prefill_interleave_stats["deferred_for_cache"] += 1
                     break
-                # The callback must not use padded slot 0 or a different graph
-                # near the logical limit while slot 0 holds prefill state.
-                if self.mtp and req.pos + self.ds.block >= self.max_seq_len:
-                    break
-                self._decode_active_once()
+                self._decode_active_once(active_ids=[sid])
+                self._prefill_last_slot = sid
                 self.prefill_interleave_stats["decode_steps"] += 1
         finally:
             try:
@@ -5084,7 +5124,7 @@ class Engine:
                 self.current_phase = phase
                 self._cooperating_prefill = False
                 self._prefill_last_decode_yield = time.perf_counter()
-                self.prefill_interleave_stats["decode_tokens"] += max(0, len(req.out_tokens) - before)
+                self.prefill_interleave_stats["decode_tokens"] += max(0, sum(len(req.out_tokens) for req in requests) - before)
                 with self._slot_lock:
                     self.mtp_stats["status"] = "prefilling"
         return self.prefill_interleave_stats["decode_steps"] > steps_before
@@ -5302,6 +5342,7 @@ class Engine:
                         logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids, images=req.images, token_types=req.token_types)
                         first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
                         # Copy per-sequence cache state from slot 0 to target decode slot
+                        self._invalidate_live_slot(slot_id)
                         self.rt.copy_seq(0, slot_id, req_id=req.req_id)
                         if self.mtp:
                             self._seed_batch_mtp(req, slot_id)
@@ -5311,6 +5352,9 @@ class Engine:
                             tracked = [-1] if req.images is not None else list(req.prompt_ids)
                             self._slot_tokens[0] = list(tracked)
                             self._slot_tokens[slot_id] = list(tracked)
+                        if req.images is None:
+                            self._mark_live_slot(0, len(req.prompt_ids))
+                            self._mark_live_slot(slot_id, len(req.prompt_ids))
                         pf_stats = getattr(self, "last_prefill_stats", None)
                         with self._slot_lock:
                             st = self.slot_states.get(slot_id, {})
@@ -5397,7 +5441,7 @@ class Engine:
                 self._decode_active_once()
 
     @torch.inference_mode()
-    def _decode_active_once(self):
+    def _decode_active_once(self, active_ids=None):
         """One decode iteration; caller owns self.lock, including prefill callbacks."""
         for req in list(self._active_slots.values()):
             if req.cancel_event.is_set():
@@ -5405,8 +5449,13 @@ class Engine:
         if not self._active_slots:
             return
         B = self.rt.B
-        active_ids = list(self._active_slots.keys())
+        active_ids = (list(self._active_slots) if active_ids is None else
+                      [sid for sid in active_ids if sid in self._active_slots])
         n_active = len(active_ids)
+        if not active_ids:
+            return
+        for sid in active_ids:
+            self._invalidate_live_slot(sid)
 
         if self.mtp:
             try:
@@ -5448,6 +5497,7 @@ class Engine:
                         self.slot_states[s_id] = st
                     return
             else:
+                self._invalidate_live_slot(0)
                 toks, poss, seqs, pmaxs = [], [], [], []
                 for s_id in active_ids:
                     req = self._active_slots[s_id]
@@ -5484,6 +5534,9 @@ class Engine:
                     return
 
             # Sample tokens per slot with optional repetition/presence/frequency penalties
+            for sid in active_ids:
+                if self._active_slots[sid].images is None:
+                    self._mark_live_slot(sid, self._active_slots[sid].pos + 1)
             sampled_tokens = []
             for idx, s_id in enumerate(active_ids):
                 req = self._active_slots[s_id]

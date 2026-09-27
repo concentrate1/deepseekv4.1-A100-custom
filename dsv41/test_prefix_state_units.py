@@ -1,5 +1,7 @@
 """CPU regressions for snapshot coverage and scalar multi-anchor capture."""
 import unittest
+import os
+from unittest.mock import patch
 from types import SimpleNamespace
 import torch
 from .engine import Engine
@@ -97,6 +99,7 @@ class PrefixStateTests(unittest.TestCase):
         self.assertEqual(snap_map["'cache'"].shape, (1, 20))
         self.assertEqual(snap_map["'window_kv_cache'"].shape, (1, 20, 4))
 
+    @patch.dict(os.environ, {'DSV41_LIVE_SLOT_REUSE': '1'})
     def test_find_best_gpu_slot(self):
         e = Engine.__new__(Engine)
         e._slot_tokens = {}
@@ -105,27 +108,31 @@ class PrefixStateTests(unittest.TestCase):
         self.assertEqual(slot, -1)
         self.assertEqual(lcp, 0)
 
-        # Slot 1 has partial match, Slot 2 has longer match
+        # Prefer the deepest valid continuation, not a longer but stale prefix.
         e._slot_tokens = {
-            1: [10, 20, 30, 40],
-            2: [10, 20, 30, 40, 50, 60],
+            1: list(range(64)),
+            2: list(range(80)),
             3: [99, 99],
         }
-        slot, lcp = e._find_best_gpu_slot([10, 20, 30, 40, 50, 60, 70, 80])
+        e._slot_cache_ends = {1: 64, 2: 80}
+        slot, lcp = e._find_best_gpu_slot(list(range(100)))
         self.assertEqual(slot, 2)
-        self.assertEqual(lcp, 6)
+        self.assertEqual(lcp, 80)
 
         # Tie: prefer slot 0
         e._slot_tokens = {
-            0: [1, 2, 3, 4],
-            1: [1, 2, 3, 4],
+            0: list(range(64)),
+            1: list(range(64)),
         }
-        slot, lcp = e._find_best_gpu_slot([1, 2, 3, 4, 5])
+        e._slot_cache_ends = {0: 64, 1: 64}
+        slot, lcp = e._find_best_gpu_slot(list(range(100)))
         self.assertEqual(slot, 0)
-        self.assertEqual(lcp, 4)
+        self.assertEqual(lcp, 64)
 
+    @patch.dict(os.environ, {'DSV41_LIVE_SLOT_REUSE': '1'})
     def test_gpu_slot_prefill_reuse(self):
         e = Engine.__new__(Engine)
+        e._slot_cache_ends = {2: 80}
         copied = []
         forwarded = []
         e.rt = SimpleNamespace(copy_seq=lambda src, dst, req_id="": copied.append((src, dst)))
@@ -140,7 +147,7 @@ class PrefixStateTests(unittest.TestCase):
 
         prompt = list(range(100)) # 100 tokens
         logits, reused = e._prefill_with_gpu_slot_reuse(prompt, best_slot=2, best_lcp=85)
-        # best_lcp 85 -> aligned to 16: 80
+        # The cache is committed at 80; no state after 80 has been written.
         self.assertEqual(reused, 80)
         self.assertEqual(copied, [(2, 0)])
         self.assertEqual(forwarded, [(prompt, 80)])
@@ -148,13 +155,14 @@ class PrefixStateTests(unittest.TestCase):
         self.assertEqual(e.last_prefill_stats["reused_tokens"], 80)
         self.assertEqual(e.last_prefill_stats["new_tokens"], 20)
 
-        # Exact match (best_lcp == 100) -> reuse_pos max(0, 100 - 16) = 84
+        # An identical prompt requires a rewind to compute logits: refuse it.
         copied.clear()
         forwarded.clear()
-        logits, reused = e._prefill_with_gpu_slot_reuse(prompt, best_slot=0, best_lcp=100)
-        self.assertEqual(reused, 84)
-        self.assertEqual(copied, []) # best_slot is 0, no copy needed!
-        self.assertEqual(forwarded, [(prompt, 84)])
+        e._slot_cache_ends[0] = 100
+        with self.assertRaisesRegex(ValueError, 'committed'):
+            e._prefill_with_gpu_slot_reuse(prompt, best_slot=0, best_lcp=100)
+        self.assertEqual(copied, [])
+        self.assertEqual(forwarded, [])
 
     def test_copy_seq_with_inference_tensors(self):
         from .decode import DecodeRuntime

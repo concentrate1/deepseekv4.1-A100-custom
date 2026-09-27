@@ -167,6 +167,30 @@ class BatchMTPTests(unittest.TestCase):
         self.assertEqual(e._free_decode_slots, [1, 2])
         self.assertEqual(e.mtp_stats['status'], 'completed')
 
+    def test_selected_decode_leaves_other_request_pending(self):
+        from .streaming import IncrementalTokenDecoder
+        e = self.make_engine()
+        e._slot_tokens_lock = threading.Lock()
+        e._slot_tokens = {1: [1], 2: [2]}
+        e.slot_states = {1: {}, 2: {}}
+        e._free_decode_slots = []
+        e.stats_tracker = None
+        e.eos = 0
+        e.tok = types.SimpleNamespace(decode=lambda ids, **kw: ''.join(map(str, ids)))
+        first, second = e._active_slots[1], e._active_slots[2]
+        second.text_decoder = IncrementalTokenDecoder(e.tok)
+        def step(ids):
+            self.assertEqual(ids, [2])
+            return [[8, 0]]
+        e._batch_mtp_step = step
+        e._decode_active_once(active_ids=[2])
+        self.assertEqual(first.pos, 10)
+        self.assertEqual(first.out_tokens, [1])
+        self.assertFalse(first.done_event.is_set())
+        self.assertTrue(second.done_event.is_set())
+        self.assertEqual(list(e._active_slots), [1])
+        self.assertEqual(e._free_decode_slots, [2])
+
     def test_prefill_seeds_only_selected_draft_slot(self):
         e = self.make_engine()
         rings = torch.arange(18).reshape(3, 3, 2).clone()

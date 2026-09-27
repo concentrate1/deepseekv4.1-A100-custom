@@ -27,6 +27,7 @@ _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from .engine import Engine, GenParams, parse_budgets
 from .stats import StatsTracker
 from .streaming import ChatStreamSplitter
+from .sse import SSEWriter
 
 ENGINE: Engine | None = None
 STATS_TRACKER: StatsTracker | None = None
@@ -430,21 +431,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            heartbeat_stop = threading.Event()
-            sse_lock = threading.Lock()
-            heartbeat_thread = None
-            def _sse_write(data):
-                with sse_lock:
-                    self.wfile.write(data)
-                    self.wfile.flush()
-            def _heartbeat():
-                while not heartbeat_stop.wait(10.0):
-                    try:
-                        _sse_write(b": keep-alive\n\n")
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-            heartbeat_thread.start()
+            writer = SSEWriter(self.wfile, getattr(self, "_request_cancel", None)).start()
+            _sse_write = writer.write
             if STATS_TRACKER:
                 STATS_TRACKER.record_request_start(len(ids), stream=True)
             t_gen_0 = time.perf_counter()
@@ -459,8 +447,9 @@ class Handler(BaseHTTPRequestHandler):
                     obj["usage"] = usage
                 _sse_write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
 
-            stream_iterator = eng.stream_text(ids, params, images=images, token_types=token_types, **self._cancel_kwargs())
+            stream_iterator = None
             try:
+                stream_iterator = eng.stream_text(ids, params, images=images, token_types=token_types, **self._cancel_kwargs())
                 chunk({"role": "assistant"})
                 for piece, final_count in stream_iterator:
                     if final_count is None:
@@ -502,7 +491,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "model": body.get("model") or eng.model_name,
                                    "choices": [], "usage": usage}
                     _sse_write(("data: " + json.dumps(usage_chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
-                _sse_write(b"data: [DONE]\n\n")
+                writer.finish()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 if STATS_TRACKER:
                     STATS_TRACKER.record_disconnect()
@@ -512,14 +501,13 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[chat-error] stream failed req_id={rid}: {e}\n{tb}", flush=True)
                 try:
                     _sse_write(("data: " + json.dumps({"error": {"message": str(e), "type": "generation_error"}}, ensure_ascii=False) + "\n\n").encode())
-                    _sse_write(b"data: [DONE]\n\n")
+                    writer.finish()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 return
             finally:
+                writer.close()
                 getattr(stream_iterator, "close", lambda: None)()
-                heartbeat_stop.set()
-                heartbeat_thread.join(timeout=1.0)
                 self.close_connection = True
             dt_gen = time.perf_counter() - t_gen_0
             decode_tok_s = getattr(eng, "last_decode_tok_s", None)
@@ -596,8 +584,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             n = 0
             t_gen_0 = time.perf_counter()
-            stream_iterator = eng.stream_text(ids, params, images=images, token_types=token_types, **self._cancel_kwargs())
+            writer = SSEWriter(self.wfile, getattr(self, "_request_cancel", None)).start()
+            stream_iterator = None
             try:
+                stream_iterator = eng.stream_text(ids, params, images=images, token_types=token_types, **self._cancel_kwargs())
                 emitted = ""
                 for piece, final_count in stream_iterator:
                     if final_count is not None:
@@ -611,8 +601,7 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     obj = {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                            "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                    writer.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
                 usage = {"prompt_tokens": len(ids), "completion_tokens": n,
                          "total_tokens": len(ids) + n}
                 finish = "length" if getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens else "stop"
@@ -622,14 +611,13 @@ class Handler(BaseHTTPRequestHandler):
                                 "choices": [{"index": 0, "text": "", "finish_reason": finish}]}
                 if not include_usage:
                     finish_chunk["usage"] = usage
-                self.wfile.write(("data: " + json.dumps(finish_chunk, ensure_ascii=False) + "\n\n").encode())
+                writer.write(("data: " + json.dumps(finish_chunk, ensure_ascii=False) + "\n\n").encode())
                 if include_usage:
                     usage_chunk = {"id": rid, "object": "text_completion", "created": created,
                                    "model": body.get("model") or eng.model_name,
                                    "choices": [], "usage": usage}
-                    self.wfile.write(("data: " + json.dumps(usage_chunk, ensure_ascii=False) + "\n\n").encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                    writer.write(("data: " + json.dumps(usage_chunk, ensure_ascii=False) + "\n\n").encode())
+                writer.finish()
                 dt_gen = time.perf_counter() - t_gen_0
                 decode_tok_s = getattr(eng, "last_decode_tok_s", None)
                 if decode_tok_s is None:
@@ -647,12 +635,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 print(f"[completion-error] stream failed: {exc}", flush=True)
                 try:
-                    self.wfile.write(("data: " + json.dumps({"error": {"message": str(exc), "type": "generation_error"}}) + "\n\n").encode())
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
+                    writer.write(("data: " + json.dumps({"error": {"message": str(exc), "type": "generation_error"}}) + "\n\n").encode())
+                    writer.finish()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
             finally:
+                writer.close()
                 getattr(stream_iterator, "close", lambda: None)()
                 self.close_connection = True
             return
@@ -728,40 +716,22 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.end_headers()
 
-            heartbeat_stop = threading.Event()
-            sse_lock = threading.Lock()
-
-            def _sse_write(data: bytes):
-                with sse_lock:
-                    self.wfile.write(data)
-                    self.wfile.flush()
-
-            def _heartbeat():
-                while not heartbeat_stop.wait(5.0):
-                    try:
-                        _sse_write(b": keep-alive\n\n")
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-
-            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-            heartbeat_thread.start()
+            writer = SSEWriter(self.wfile, getattr(self, "_request_cancel", None)).start()
+            _sse_write = writer.write
 
             try:
                 assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
             except Exception as e:
-                heartbeat_stop.set()
-                heartbeat_thread.join(timeout=1.0)
                 tb = traceback.format_exc()
                 print(f"[jev-error] {e}\n{tb}", flush=True)
                 try:
                     err_payload = json.dumps({"error": {"message": str(e), "type": "jev_error"}}, ensure_ascii=False)
-                    _sse_write(f"data: {err_payload}\n\ndata: [DONE]\n\n".encode("utf-8"))
+                    writer.finish(f"data: {err_payload}\n\ndata: [DONE]\n\n".encode("utf-8"))
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 return
-
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1.0)
+            finally:
+                writer.close()
 
             json_content = json.dumps(assembled, ensure_ascii=False)
             dt_total = time.perf_counter() - t0

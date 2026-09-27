@@ -9,6 +9,8 @@ import torch
 
 
 def enabled(engine):
+    # 批量 MTP 默认用显存保存快照以加快恢复；设为 0 仍可使用主机快照。
+    # 与活动槽位续算开关独立，通常仅在排查显存压力或缓存问题时关闭。
     return (getattr(engine, "max_seqs", 1) > 1 and bool(getattr(engine, "mtp", 0))
             and os.environ.get("DSV41_GPU_PREFIX_CACHE", "1") != "0"
             and float(os.environ.get("DSV41_GPU_PREFIX_CACHE_GB", "4")) > 0)
