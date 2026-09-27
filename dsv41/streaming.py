@@ -60,8 +60,12 @@ class ChatStreamSplitter:
                 thought = raw
             if "</think>" in thought:
                 thought, visible = thought.split("</think>", 1)
+            elif "<｜DSML｜ calls>" in thought:
+                thought, calls = thought.split("<｜DSML｜ calls>", 1)
+                thought = thought.rstrip("\n")
+                visible = "<｜DSML｜ calls>" + calls
             else:
-                thought = _safe_prefix(thought, ("</think>",))
+                thought = _safe_prefix(thought, ("</think>", "<｜DSML｜ calls>")).rstrip("\n")
                 visible = None
             if thought.startswith(self.reasoning):
                 delta = thought[len(self.reasoning):]
@@ -76,7 +80,9 @@ class ChatStreamSplitter:
             visible = _safe_prefix(raw, ("<think>", "</think>"))
 
         visible = visible.split("<｜DSML｜ calls>", 1)[0]
-        visible = _safe_prefix(visible, ("<｜DSML｜ calls>",))
+        # Newlines immediately before a calls block belong to its delimiter.
+        # Hold them until more text arrives or the final parser flushes them.
+        visible = _safe_prefix(visible, ("<｜DSML｜ calls>",)).rstrip("\n")
         if visible.startswith(self.content):
             delta = visible[len(self.content):]
             if delta:

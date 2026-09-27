@@ -886,22 +886,28 @@ class Engine:
 
         if "</think>" in clean_text:
             parts = clean_text.split("</think>", 1)
-            reasoning = parts[0].strip()
+            reasoning = parts[0]
             if "<think>" in reasoning:
-                reasoning = reasoning.split("<think>", 1)[1].strip()
+                reasoning = reasoning.split("<think>", 1)[1]
             clean_text = parts[1]
         elif "<think>" in clean_text:
-            reasoning = clean_text.split("<think>", 1)[1].strip()
-            clean_text = ""
+            thought = clean_text.split("<think>", 1)[1]
+            if "<｜DSML｜ calls>" in thought:
+                reasoning, calls = thought.split("<｜DSML｜ calls>", 1)
+                reasoning = reasoning.rstrip("\n")
+                clean_text = "<｜DSML｜ calls>" + calls
+            else:
+                reasoning = thought
+                clean_text = ""
         elif (thinking_mode or self.thinking_mode) == "thinking":
             # The prompt already ends with <think>. If generation stops before
             # </think>, all text so far is reasoning, not visible content.
             call_start = clean_text.find("<｜DSML｜ calls>")
             if call_start >= 0:
-                reasoning = clean_text[:call_start].strip()
+                reasoning = clean_text[:call_start].rstrip("\n")
                 clean_text = clean_text[call_start:]
             else:
-                reasoning = clean_text.strip()
+                reasoning = clean_text
                 clean_text = ""
 
         if "<｜DSML｜ calls>" in clean_text:
@@ -918,8 +924,10 @@ class Engine:
                 clean_text += "\n</｜DSML｜ calls>"
 
         try:
-            res = self._parse(clean_text + eos, thinking_mode=thinking_mode or self.thinking_mode)
-            if reasoning and not res.get("reasoning_content"):
+            # Thinking has already been separated above. The remaining text
+            # is a chat body; asking the parser to find </think> again fails.
+            res = self._parse(clean_text + eos, thinking_mode="chat")
+            if reasoning is not None:
                 res["reasoning_content"] = reasoning
             return res
         except Exception:
@@ -931,7 +939,7 @@ class Engine:
             if tool_calls:
                 content = clean_text
                 if "<｜DSML｜" in content:
-                    content = content[:content.find("<｜DSML｜")].strip()
+                    content = content[:content.find("<｜DSML｜")].rstrip("\n")
                 return {
                     "role": "assistant",
                     "content": content,
@@ -939,7 +947,7 @@ class Engine:
                     "tool_calls": tool_calls,
                 }
 
-        return {"role": "assistant", "content": clean_text.strip(), "reasoning_content": reasoning, "tool_calls": []}
+        return {"role": "assistant", "content": clean_text, "reasoning_content": reasoning, "tool_calls": []}
 
     # ---------------------------------------------------------------- generation
     @torch.inference_mode()
