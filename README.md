@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash on A100
 
-本项目 fork 自 [shi3z/deepseekv4.1-A100-custom](https://github.com/shi3z/deepseekv4.1-A100-custom)，结合本地部署的需求对原项目做了一些扩展。
+本项目 fork 自 [shi3z/deepseekv4.1-A100-custom](https://github.com/shi3z/deepseekv4.1-A100-custom)，实现在 4~5 块 A100 上部署完整版 DeepSeek V4.1 Flash，并结合本地部署的需求对原项目做了一些扩展。
 
 ## 主要扩展
 
@@ -94,3 +94,5 @@ cd /workspace
 当前服务面向可信环境中的本机部署与调试，对外开放前需自行配置访问控制。监控页面和指标接口未设置鉴权，会展示请求文本、图片预览及生成内容；部分错误响应包含 traceback。图片输入支持本地路径和 HTTP/HTTPS URL，服务会以自身权限读取文件或访问指定地址。
 
 本 fork 的代码修改、测试与文档是在 AI 辅助下编写和整理的，可能存在错误、遗漏或未经充分验证的行为。已有测试只覆盖特定条件，不构成对正确性、稳定性或适用于任何部署环境的保证。使用前请根据自己的硬件、模型和负载进行审查与验证。
+
+项目作者在以下社区活动：[LINUX DO](https://linux.do/u/concentrate1)
